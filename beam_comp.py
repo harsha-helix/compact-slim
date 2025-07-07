@@ -58,3 +58,48 @@ class compensated_mattis_interactions:
         print(self.J)
 
         self.eigvals, self.eigvecs = np.linalg.eigh(self.J)
+    
+    def encode_and_display(self, spin_vector):
+        for k in range(self.n_spins):
+            
+            xi_k = self.eigvecs[:, k]
+            xi_comp = self.Ai * xi_k
+            xi_comp = np.clip(xi_comp, -1.0, 1.0)
+            alpha_ik = np.arccos(xi_comp)
+
+            phase_mask = np.zeros((self.n_spins * self.MACRO_PIX_Y, self.MACRO_PIX_X))
+            for i in range(self.n_spins):
+                for l in range(self.MACRO_PIX_X):
+                    phi_raw = spin_vector[i] * (np.pi/2) + ((-1)**l) * alpha_ik[i]
+                    phi_slm = phi_raw + 2 * np.pi
+                    phase_mask[i*self.MACRO_PIX_Y:(i+1)*self.MACRO_PIX_Y, l] = phi_slm
+
+         
+            for i in range(self.n_spins):
+                phases = []
+                for l in range(self.MACRO_PIX_X):
+                    phi_raw = spin_vector[i] * (np.pi/2) + ((-1)**l) * alpha_ik[i]
+                    phases.append(phi_raw + 2 * np.pi)
+        
+
+            plt.figure(figsize=(8, 4))
+            plt.imshow(phase_mask, cmap='twilight', aspect='auto')
+            plt.colorbar(label='Phase (radians)')
+            plt.title(f'Compensated Phase Mask for Mattis Hamiltonian k = {k}')
+            plt.xlabel('Sub-pixel Index')
+            plt.ylabel('Macropixel (Spin Index)')
+            plt.tight_layout()
+            plt.show()
+            return phase_mask
+        
+    def run(self, spin_vector):
+        self.get_number_of_spins()
+        self.choose_macropixel_size()
+        self.get_gaussian_parameters()
+        self.build_intensity_map()
+        self.compute_compensation_factors()
+        self.get_interaction_matrix()
+        self.eigen_decomposition()
+        self.random_spin_configuration()
+        self.encode_and_display(spin_vector)
+        print(self.spins)
