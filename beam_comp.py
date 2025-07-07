@@ -15,6 +15,7 @@ class compensated_mattis_interactions:
         self._compute_intensity_map()
         self._compute_compensation_factors()
         self.eigvals = None
+        self.eigvecs = None
     def _choose_macropixel_size(self):
         tile_x = self.SLM_WIDTH // self.n_spins
         tile_y = self.SLM_HEIGHT // self.n_spins
@@ -92,14 +93,11 @@ class compensated_mattis_interactions:
             plt.show()
             return phase_mask
         
+    def prep(self, spin_vector):
+        self.get_mattis_interactions()
+        
+        
+
     def run(self, spin_vector):
-        self.get_number_of_spins()
-        self.choose_macropixel_size()
-        self.get_gaussian_parameters()
-        self.build_intensity_map()
-        self.compute_compensation_factors()
-        self.get_interaction_matrix()
-        self.eigen_decomposition()
-        self.random_spin_configuration()
         self.encode_and_display(spin_vector)
-        print(self.spins)
+        
