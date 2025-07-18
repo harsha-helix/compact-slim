@@ -185,7 +185,6 @@ class CompensatedMattisInteractions:
             raise ValueError("spin_vector must only contain values of -1 or 1.")
 
         # Loop over each eigenmode (Mattis Hamiltonian)
-        list_of_phase_masks = []
         for k in range(self.num_spins):
             phase_mask = np.zeros((self.slm_height, self.slm_width))
 
@@ -232,10 +231,8 @@ class CompensatedMattisInteractions:
                 # Modulo 2*pi for SLM display
                 phase_mask[y0:y0 + self._macro_pix_y, x0:x0 + self._macro_pix_x] = phi_block % (2 * np.pi)
 
-            # if k < display_limit:
-            list_of_phase_masks.append(phase_mask)
-            #     self._display_mask(phase_mask, k)
-        return list_of_phase_masks
+            if k < display_limit:
+                self._display_mask(phase_mask, k)
 
     def _display_mask(self, phase_mask: np.ndarray, eigenmode_index: int):
         """Helper function to plot a generated phase mask."""
