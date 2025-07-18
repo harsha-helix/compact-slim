@@ -187,11 +187,11 @@ class CompensatedMattisInteractions:
         # Loop over each eigenmode (Mattis Hamiltonian)
         list_of_phase_masks = []
         for k in range(self.num_spins):
-            phase_mask = np.zeros((self.slm_height, self.slm_width))
+            phase_mask = np.zeros((self.slm_height, self.slm_width), dtype=np.float32)
 
             # The phase modulation amplitude for each spin, compensated for beam intensity.
             # This is clipped to ensure the argument of arccos is valid.
-            compensated_eigvec =  self.eigvecs[:, k] # self._compensation_factors *
+            compensated_eigvec = self._compensation_factors * self.eigvecs[:, k] # self._compensation_factors *
             alpha_ik = np.arccos(np.clip(compensated_eigvec, -1.0, 1.0))
 
             # Populate the phase mask for each spin's macropixel
@@ -231,6 +231,7 @@ class CompensatedMattisInteractions:
                 phase_mask[y0:y0 + self._macro_pix_y, x0:x0 + self._macro_pix_x] = phi_block % (2 * np.pi)
                 # Modulo 2*pi for SLM display
                 phase_mask[y0:y0 + self._macro_pix_y, x0:x0 + self._macro_pix_x] = phi_block % (2 * np.pi)
+                phase_mask = phase_mask.astype(np.float32)  # Ensure float32 for SLM compatibility
 
             # if k < display_limit:
             list_of_phase_masks.append(phase_mask)
