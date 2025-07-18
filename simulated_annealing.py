@@ -173,12 +173,15 @@ def run_photonic_annealing(num_spins, evaluate_spin_vector_func, initial_temp, f
     # Initialize a 1D spin vector with random spins (-1 or 1)
     current_spin_vector = np.random.choice([-1, 1], size=num_spins)
 
+    start_time = time.time()
+
     # Get the initial energy measurement by evaluating the initial spin vector
     print("Evaluating initial random spin configuration...")
     current_energy = evaluate_spin_vector_func(current_spin_vector)
     print(f"Initial measured energy: {current_energy:.4f}")
 
     temp = initial_temp
+    energy_plot = []
     
     print("\nStarting photonic simulated annealing...")
     print(f"Initial Temp: {initial_temp}, Final Temp: {final_temp}, Cooling Rate: {cooling_rate}")
@@ -205,15 +208,19 @@ def run_photonic_annealing(num_spins, evaluate_spin_vector_func, initial_temp, f
                 current_spin_vector = proposed_spin_vector
                 current_energy = proposed_energy
 
+            energy_plot.append(current_energy)
 
             if step % 100 == 0:
                 print(f"  Step {step}/{steps_per_temp} | Current Energy: {current_energy:.4f}")
 
         # Cool the system down
-        temp *= cooling_rate
-
+       
     print("\nSimulated annealing finished.")
-    return current_spin_vector
+    temp *= cooling_rate
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Total time taken: {elapsed_time:.2f} seconds")
+    return current_spin_vector, energy_plot
 
 
 def data_loader(filename):
