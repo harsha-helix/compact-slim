@@ -1,0 +1,2 @@
+distance,read_0,read_1,read_2,read_3,read_4,read_5,read_6,read_7,read_8,read_9
+30.0,
