@@ -1,13 +1,14 @@
 # Intensity profile:
-Code used to measure intensity profile of expanded beam using Basler CMOS camera using multiple images of different exposure
+Code used to measure intensity profile of expanded beam using Basler CMOS camera using multiple images of different exposures.
 
-# Phase encoding SPIM:
-Function to obtain phase values for pixels from a given spin arrangement and interaction matrix of Ising Hamiltonian
-
-# Beam_comp.py:
+# beam_comp.py:
 Gives phase mapping for gaussian beam corrected mattis interactions on SLM
 
-# TODO:
-1. Phase to greyscale mapper (update CLUT in HOLOEYE Config)
-2. Simulated Annealing feedback loop
-3. Integrate intensity measurement using camera to calculate hamiltonian optically
+# simulated_annealing.py:
+Helper functions to connect to SLM, display phasemasks for mattis hamiltonians and measure energy using photodiode and run simulated annealing loop
+
+# Photonic_SA.ipynb:
+Imports beam_comp.py and has same functions as simulated_annealing.py, used for testing.
+
+# Output.png:
+Result of MaxCut using MC100.npz graph (100 spins), obtained cut 1249, best cut 1287.
