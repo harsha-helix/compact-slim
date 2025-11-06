@@ -2,6 +2,8 @@ import numpy as np
 import math
 import matplotlib.pyplot as plt
 from typing import Tuple, List
+import concurrent.futures
+import itertools
 
 class CompensatedMattisInteractions:
     """
@@ -92,7 +94,7 @@ class CompensatedMattisInteractions:
 
         self._grid_rows, self._grid_cols = best_layout
         if self._grid_rows * self._grid_cols < self.num_spins:
-             raise RuntimeError("Failed to find a macropixel grid that fits all spins.")
+            raise RuntimeError("Failed to find a macropixel grid that fits all spins.")
 
         self._macro_pix_x = self.slm_width // self._grid_cols
         self._macro_pix_y = self.slm_height // self._grid_rows
@@ -165,76 +167,101 @@ class CompensatedMattisInteractions:
         self._perform_eigendecomposition()
         print("Preparation complete.")
 
+    def _create_single_mask_worker(self, args_tuple: Tuple[int, np.ndarray]) -> np.ndarray:
+        """
+        Worker function to create a phase mask for a single eigenmode k.
+        Designed to be called by a thread pool executor.
+
+        Args:
+            args_tuple (Tuple[int, np.ndarray]): A tuple containing the eigenmode
+                                                  index `k` and the `spin_vector`.
+
+        Returns:
+            np.ndarray: The computed phase mask for the given eigenmode.
+        """
+        k, spin_vector = args_tuple
+        phase_mask = np.zeros((self.slm_height, self.slm_width), dtype=np.float32)
+
+        # The phase modulation amplitude for each spin, compensated for beam intensity.
+        compensated_eigvec = self._compensation_factors * self.eigvecs[:, k]
+        alpha_ik = np.arccos(np.clip(compensated_eigvec, -1.0, 1.0))
+
+        # Populate the phase mask for each spin's macropixel
+        for i in range(self.num_spins):
+            spin_state = spin_vector[i]
+            amplitude = alpha_ik[i]
+
+            row = i // self._grid_cols
+            col = i % self._grid_cols
+            x0 = self._grid_offset_x + col * self._macro_pix_x
+            y0 = self._grid_offset_y + row * self._macro_pix_y
+
+            # Create the checkerboard pattern for diffraction
+            lx = np.arange(self._macro_pix_x)
+            ly = np.arange(self._macro_pix_y)
+            lx_grid, ly_grid = np.meshgrid(lx, ly)
+            checkerboard = ((-1)**(lx_grid + ly_grid)) * amplitude
+
+            # Determine the phase offset from the spin state
+            if spin_state == 1:
+                spin_phase = np.pi / 2
+            else:  # spin_state == -1
+                spin_phase = 3 * np.pi / 2
+
+            # Add the spin's phase to the checkerboard pattern and apply modulo for SLM
+            phi_block = spin_phase + checkerboard
+            phase_mask[y0:y0 + self._macro_pix_y, x0:x0 + self._macro_pix_x] = phi_block % (2 * np.pi)
+
+        return phase_mask.astype(np.float32)
+
     def generate_phase_masks(
         self,
         spin_vector: List[int],
         display_limit: int = 5
-    ):
+    ) -> List[np.ndarray]:
         """
-        Generates and displays the phase mask for each Mattis Hamiltonian (eigenmode k)
-        based on a given spin configuration.
+        Generates the phase mask for each Mattis Hamiltonian (eigenmode k)
+        based on a given spin configuration using multithreading.
 
         Args:
             spin_vector (List[int]): A 1D list or array of {-1, 1} representing the spin state.
             display_limit (int): The maximum number of eigenmode plots to display. Set to 0 for no plots.
+
+        Returns:
+            List[np.ndarray]: A list containing the generated phase mask for each eigenmode.
         """
         spin_vector = np.asarray(spin_vector)
         if spin_vector.shape != (self.num_spins,):
             raise ValueError(f"spin_vector must be a 1D array of length {self.num_spins}")
         if not np.all(np.isin(spin_vector, [-1, 1])):
             raise ValueError("spin_vector must only contain values of -1 or 1.")
+        
+        if self.eigvecs is None:
+            raise RuntimeError("Model is not prepared. Call prep() before generating masks.")
 
-        # Loop over each eigenmode (Mattis Hamiltonian)
         list_of_phase_masks = []
-        for k in range(self.num_spins):
-            phase_mask = np.zeros((self.slm_height, self.slm_width))
+        
+        # Use a thread pool to generate masks in parallel
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            # Create an iterable of arguments for the worker function.
+            # Each element is a tuple (k, spin_vector).
+            # itertools.repeat is used to efficiently pass the same spin_vector
+            # to each worker without duplicating it in memory.
+            args_iterable = zip(range(self.num_spins), itertools.repeat(spin_vector))
+            
+            # executor.map applies the worker function to each argument tuple
+            # and returns the results in the order they were submitted.
+            print(f"\nGenerating {self.num_spins} phase masks using multiple threads...")
+            list_of_phase_masks = list(executor.map(self._create_single_mask_worker, args_iterable))
+            print("Mask generation complete.")
 
-            # The phase modulation amplitude for each spin, compensated for beam intensity.
-            # This is clipped to ensure the argument of arccos is valid.
-            compensated_eigvec =  self.eigvecs[:, k] # self._compensation_factors *
-            alpha_ik = np.arccos(np.clip(compensated_eigvec, -1.0, 1.0))
+        # Display a limited number of the generated masks
+        if display_limit > 0:
+            print(f"\nDisplaying the first {min(display_limit, self.num_spins)} masks...")
+        for k, phase_mask in enumerate(list_of_phase_masks):
+            if k < display_limit:
+                self._display_mask(phase_mask, k)
 
-            # Populate the phase mask for each spin's macropixel
-            for i in range(self.num_spins):
-                spin_state = spin_vector[i]
-                amplitude = alpha_ik[i]
-
-                row = i // self._grid_cols
-                col = i % self._grid_cols
-                x0 = self._grid_offset_x + col * self._macro_pix_x
-                y0 = self._grid_offset_y + row * self._macro_pix_y
-
-                # Create the checkerboard pattern for diffraction
-                lx = np.arange(self._macro_pix_x)
-                ly = np.arange(self._macro_pix_y)
-                lx_grid, ly_grid = np.meshgrid(lx, ly)
-
-                checkerboard = ((-1)**(lx_grid + ly_grid)) * amplitude
-
-                # The final phase depends on the spin state and the checkerboard
-                # The spin state effectively shifts the phase of one half of the checkerboard
-                # relative to the other, encoding the spin information.
-                #phi_block = spin_state * checkerboard # spin_state *
-                                # ... inside the loop ...
-                checkerboard = ((-1)**(lx_grid + ly_grid)) * amplitude
-
-                # 1. Determine the phase offset from the spin state
-                if spin_state == 1:
-                    spin_phase = np.pi / 2
-                else: # spin_state == -1
-                    spin_phase = 3 * np.pi / 2
-
-                # 2. Add the spin's phase to the checkerboard pattern
-                phi_block = spin_phase + checkerboard
-
-                # 3. Apply modulo for SLM display
-                phase_mask[y0:y0 + self._macro_pix_y, x0:x0 + self._macro_pix_x] = phi_block % (2 * np.pi)
-                # Modulo 2*pi for SLM display
-                phase_mask[y0:y0 + self._macro_pix_y, x0:x0 + self._macro_pix_x] = phi_block % (2 * np.pi)
-
-            # if k < display_limit:
-            list_of_phase_masks.append(phase_mask)
-            #     self._display_mask(phase_mask, k)
         return list_of_phase_masks
 
     def _display_mask(self, phase_mask: np.ndarray, eigenmode_index: int):
@@ -269,12 +296,12 @@ class CompensatedMattisInteractions:
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.show()
 
-    def run(self, spin_vector: List[int]):
+    def run(self, spin_vector: List[int], display_limit: int = 5):
         """
         A convenience method to prepare the model, then generate and display phase masks.
         """
-        #self.prep()
-        self.generate_phase_masks(spin_vector)
+        self.prep()
+        self.generate_phase_masks(spin_vector, display_limit=display_limit)
 
 
 if __name__ == '__main__':
@@ -283,15 +310,15 @@ if __name__ == '__main__':
     # 1. Define the interaction matrix J for the spins
     NUM_SPINS = 40
     # Example: Ferromagnetic coupling (all spins want to align)
-    J_ferro = np.ones((NUM_SPINS, NUM_SPINS))
+    # J_ferro = np.ones((NUM_SPINS, NUM_SPINS))
     # Example: Random interaction matrix
     np.random.seed(42)
     J_random = np.random.randn(NUM_SPINS, NUM_SPINS)
     J_random = (J_random + J_random.T) / 2 # Ensure symmetry
 
     # 2. Define the experimental parameters
-    BEAM_SIGMA_X = 100  # Gaussian beam width in pixels
-    BEAM_SIGMA_Y = 100  # Gaussian beam height in pixels
+    BEAM_SIGMA_X = 600   # Gaussian beam width in pixels
+    BEAM_SIGMA_Y = 400   # Gaussian beam height in pixels
     SLM_WIDTH = 1920
     SLM_HEIGHT = 1080
 
@@ -310,4 +337,4 @@ if __name__ == '__main__':
 
     # 5. Run the process
     # This will prepare the model and then generate and display the phase masks.
-    mattis_model.run(spin_vector=spin_config)
+    mattis_model.run(spin_vector=spin_config, display_limit=4)

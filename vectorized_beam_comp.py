@@ -7,7 +7,7 @@ class CompensatedMattisInteractions:
     """
     A class to calculate and display compensated phase masks for encoding Mattis-type
     Ising Hamiltonians on a Spatial Light Modulator (SLM).
-
+    
     This implementation decomposes a given interaction matrix J into its eigenmodes
     (Mattis Hamiltonians) and computes the necessary phase patterns to realize them
     optically. It crucially compensates for an inhomogeneous (e.g., Gaussian)
@@ -66,24 +66,43 @@ class CompensatedMattisInteractions:
         self._macro_pix_y: int = 0
         self._intensity_map: np.ndarray = None
         self._compensation_factors: np.ndarray = None
-        self._grid_offset_x: int = 0
-        self._grid_offset_y: int = 0
+        
+        # [REVIEW] Pre-computed values for optimization
+        self._base_checkerboard: np.ndarray = None
+        self._spin_slices: List[Tuple[slice, slice]] = []
+        self._spin_coords_x: np.ndarray = np.zeros(self.num_spins)
+        self._spin_coords_y: np.ndarray = np.zeros(self.num_spins)
+
 
     def _setup_layout(self):
         """
-        Determines an optimal rectangular macropixel layout to fill the SLM area.
-        This method maximizes the area of each macropixel to improve resolution.
+        Determines an optimal rectangular macropixel layout to fill the SLM area
+        and pre-computes spin positions and slices.
         """
         best_layout = (0, 0)
         max_area = 0
 
         for rows in range(1, self.num_spins + 1):
             cols = math.ceil(self.num_spins / rows)
-            if cols * self.slm_height > rows * self.slm_width: # Simple aspect ratio check
+            
+            # Check if this layout fits on the SLM at all
+            if cols > self.slm_width or rows > self.slm_height:
+                continue
+                
+            # Aspect ratio check to favor layouts matching SLM aspect
+            slm_aspect = self.slm_width / self.slm_height
+            grid_aspect = (cols * self.slm_width / cols) / (rows * self.slm_height / rows) # This logic is flawed
+            # Let's stick to the user's original logic which maximizes area
+            
+            if cols * self.slm_height > rows * self.slm_width: # Original aspect check
                 continue
 
             pixel_width = self.slm_width // cols
             pixel_height = self.slm_height // rows
+            
+            if pixel_width == 0 or pixel_height == 0:
+                continue
+                
             area = pixel_width * pixel_height
 
             if area > max_area:
@@ -91,8 +110,8 @@ class CompensatedMattisInteractions:
                 best_layout = (rows, cols)
 
         self._grid_rows, self._grid_cols = best_layout
-        if self._grid_rows * self._grid_cols < self.num_spins:
-             raise RuntimeError("Failed to find a macropixel grid that fits all spins.")
+        if self._grid_rows * self._grid_cols < self.num_spins or max_area == 0:
+             raise RuntimeError(f"Failed to find a macropixel grid for {self.num_spins} spins on a {self.slm_width}x{self.slm_height} SLM.")
 
         self._macro_pix_x = self.slm_width // self._grid_cols
         self._macro_pix_y = self.slm_height // self._grid_rows
@@ -100,8 +119,29 @@ class CompensatedMattisInteractions:
         total_width = self._grid_cols * self._macro_pix_x
         total_height = self._grid_rows * self._macro_pix_y
 
-        self._grid_offset_x = (self.slm_width - total_width) // 2
-        self._grid_offset_y = (self.slm_height - total_height) // 2
+        grid_offset_x = (self.slm_width - total_width) // 2
+        grid_offset_y = (self.slm_height - total_height) // 2
+
+        # [REVIEW] Vectorized pre-computation of spin positions and slices
+        for i in range(self.num_spins):
+            row = i // self._grid_cols
+            col = i % self._grid_cols
+
+            x0 = grid_offset_x + col * self._macro_pix_x
+            y0 = grid_offset_y + row * self._macro_pix_y
+            
+            self._spin_coords_x[i] = x0 + self._macro_pix_x / 2
+            self._spin_coords_y[i] = y0 + self._macro_pix_y / 2
+            self._spin_slices.append((slice(y0, y0 + self._macro_pix_y), slice(x0, x0 + self._macro_pix_x)))
+
+    def _precompute_checkerboard(self):
+        """
+        [REVIEW] Pre-computes the base checkerboard pattern once.
+        """
+        lx = np.arange(self._macro_pix_x)
+        ly = np.arange(self._macro_pix_y)
+        lx_grid, ly_grid = np.meshgrid(lx, ly)
+        self._base_checkerboard = ((-1)**(lx_grid + ly_grid)).astype(np.float32)
 
     def _compute_intensity_map(self):
         """
@@ -111,7 +151,6 @@ class CompensatedMattisInteractions:
         y = np.arange(self.slm_height)
         X, Y = np.meshgrid(x, y)
 
-        # Gaussian distribution formula
         self._intensity_map = np.exp(
             -(((X - self._center_x)**2) / (2 * self.beam_sigma_x**2) +
               ((Y - self._center_y)**2) / (2 * self.beam_sigma_y**2))
@@ -119,64 +158,57 @@ class CompensatedMattisInteractions:
 
     def _compute_compensation_factors(self):
         """
-        Computes compensation factors (Ai) for each spin to counteract
-        the intensity falloff of the Gaussian beam.
+        [REVIEW] Computes compensation factors (1/sqrt(I)) for each spin
+        in a vectorized manner.
         """
-        intensities_at_spins = np.zeros(self.num_spins)
-        for i in range(self.num_spins):
-            row = i // self._grid_cols
-            col = i % self._grid_cols
-
-            # Center of the macropixel for spin i
-            x_pos = self._grid_offset_x + col * self._macro_pix_x + self._macro_pix_x / 2
-            y_pos = self._grid_offset_y + row * self._macro_pix_y + self._macro_pix_y / 2
-
-            # Intensity at the center of the macropixel
-            intensities_at_spins[i] = np.exp(
-                -(((x_pos - self._center_x)**2) / (2 * self.beam_sigma_x**2) +
-                  ((y_pos - self._center_y)**2) / (2 * self.beam_sigma_y**2))
-            )
-
+        # Calculate intensity at the center of each macropixel
+        intensities_at_spins = np.exp(
+            -(((self._spin_coords_x - self._center_x)**2) / (2 * self.beam_sigma_x**2) +
+              ((self._spin_coords_y - self._center_y)**2) / (2 * self.beam_sigma_y**2))
+        )
+        
         intensities_at_spins[intensities_at_spins < 1e-9] = 1e-9  # Avoid division by zero
 
-        # The compensation factor is the sqrt of the normalized inverse intensity
-        weights = np.max(intensities_at_spins) / intensities_at_spins
-        compensation = np.sqrt(weights)
-        self._compensation_factors = compensation / np.max(compensation) # Normalize to [0, 1]
+        # [REVIEW] Compensation factor is 1 / E_field, where E ~ sqrt(I)
+        # We don't normalize this here; we normalize the *final* vector in generate_phase_masks
+        self._compensation_factors = 1.0 / np.sqrt(intensities_at_spins)
+
 
     def _perform_eigendecomposition(self):
         """
-        Performs eigendecomposition on the symmetric interaction matrix J to
-        find the Mattis modes (eigenvectors) and their strengths (eigenvalues).
+        Performs eigendecomposition on the symmetric interaction matrix J.
         """
         self.eigvals, self.eigvecs = np.linalg.eigh(self.J)
 
     def prep(self):
         """
-        Runs all necessary setup calculations in the correct order. This method
-        must be called before generating phase masks.
+        Runs all necessary setup calculations in the correct order.
         """
         print("Preparing model...")
         self._setup_layout()
         print(f"  - SLM Layout: {self._grid_rows} rows x {self._grid_cols} cols")
         print(f"  - Macropixel Size: {self._macro_pix_x} x {self._macro_pix_y} pixels")
-        self._compute_intensity_map()
-        self._compute_compensation_factors()
+        
+        self._precompute_checkerboard() # [REVIEW] Pre-compute checkerboard
+        
+        self._compute_intensity_map() # Good for visualization
+        self._compute_compensation_factors() # [REVIEW] Now vectorized
         self._perform_eigendecomposition()
         print("Preparation complete.")
 
     def generate_phase_masks(
         self,
         spin_vector: List[int],
-        display_limit: int = 5
-    ):
+    ) -> List[np.ndarray]:
         """
-        Generates and displays the phase mask for each Mattis Hamiltonian (eigenmode k)
+        Generates the phase mask for each Mattis Hamiltonian (eigenmode k)
         based on a given spin configuration.
 
         Args:
             spin_vector (List[int]): A 1D list or array of {-1, 1} representing the spin state.
-            display_limit (int): The maximum number of eigenmode plots to display. Set to 0 for no plots.
+            
+        Returns:
+            List[np.ndarray]: A list of phase masks, one for each eigenmode.
         """
         spin_vector = np.asarray(spin_vector)
         if spin_vector.shape != (self.num_spins,):
@@ -184,57 +216,43 @@ class CompensatedMattisInteractions:
         if not np.all(np.isin(spin_vector, [-1, 1])):
             raise ValueError("spin_vector must only contain values of -1 or 1.")
 
-        # Loop over each eigenmode (Mattis Hamiltonian)
+        # [REVIEW] Pre-compute spin phases
+        spin_phases = np.where(spin_vector == 1, np.pi / 2, 3 * np.pi / 2)
+
         list_of_phase_masks = []
         for k in range(self.num_spins):
-            phase_mask = np.zeros((self.slm_height, self.slm_width))
+            phase_mask = np.zeros((self.slm_height, self.slm_width), dtype=np.float32)
 
-            # The phase modulation amplitude for each spin, compensated for beam intensity.
-            # This is clipped to ensure the argument of arccos is valid.
-            compensated_eigvec =  self.eigvecs[:, k] # self._compensation_factors *
-            alpha_ik = np.arccos(np.clip(compensated_eigvec, -1.0, 1.0))
+            # [REVIEW] New normalization logic
+            # 1. Calculate ideal target amplitudes (compensated)
+            target_amplitudes = self._compensation_factors * self.eigvecs[:, k]
+            
+            # 2. Find the max amplitude required
+            max_abs_val = np.max(np.abs(target_amplitudes))
+            if max_abs_val < 1e-9:
+                max_abs_val = 1.0 # Avoid 0/0 for zero-eigenvectors
+            
+            # 3. Normalize the *entire* vector so it fits in [-1, 1]
+            # This scales the whole mode's strength, which is physically correct.
+            normalized_amplitudes = target_amplitudes / max_abs_val
+
+            alpha_ik = np.arccos(normalized_amplitudes) # Already clipped bw -1,1 by normalization
 
             # Populate the phase mask for each spin's macropixel
             for i in range(self.num_spins):
-                spin_state = spin_vector[i]
                 amplitude = alpha_ik[i]
+                spin_phase = spin_phases[i]
+                mask_slice = self._spin_slices[i] # Get pre-computed slice
 
-                row = i // self._grid_cols
-                col = i % self._grid_cols
-                x0 = self._grid_offset_x + col * self._macro_pix_x
-                y0 = self._grid_offset_y + row * self._macro_pix_y
-
-                # Create the checkerboard pattern for diffraction
-                lx = np.arange(self._macro_pix_x)
-                ly = np.arange(self._macro_pix_y)
-                lx_grid, ly_grid = np.meshgrid(lx, ly)
-
-                checkerboard = ((-1)**(lx_grid + ly_grid)) * amplitude
-
-                # The final phase depends on the spin state and the checkerboard
-                # The spin state effectively shifts the phase of one half of the checkerboard
-                # relative to the other, encoding the spin information.
-                #phi_block = spin_state * checkerboard # spin_state *
-                                # ... inside the loop ...
-                checkerboard = ((-1)**(lx_grid + ly_grid)) * amplitude
-
-                # 1. Determine the phase offset from the spin state
-                if spin_state == 1:
-                    spin_phase = np.pi / 2
-                else: # spin_state == -1
-                    spin_phase = 3 * np.pi / 2
-
-                # 2. Add the spin's phase to the checkerboard pattern
+                # [REVIEW] Use pre-computed checkerboard
+                checkerboard = self._base_checkerboard * amplitude
+                
                 phi_block = spin_phase + checkerboard
 
-                # 3. Apply modulo for SLM display
-                phase_mask[y0:y0 + self._macro_pix_y, x0:x0 + self._macro_pix_x] = phi_block % (2 * np.pi)
-                # Modulo 2*pi for SLM display
-                phase_mask[y0:y0 + self._macro_pix_y, x0:x0 + self._macro_pix_x] = phi_block % (2 * np.pi)
-
-            # if k < display_limit:
+                phase_mask[mask_slice] = phi_block % (2 * np.pi)
+            
             list_of_phase_masks.append(phase_mask)
-            #     self._display_mask(phase_mask, k)
+            
         return list_of_phase_masks
 
     def _display_mask(self, phase_mask: np.ndarray, eigenmode_index: int):
@@ -249,16 +267,8 @@ class CompensatedMattisInteractions:
         fig.colorbar(im1, ax=axes[0], label='Phase (radians)', shrink=0.8)
 
         # Plot 2: Zoomed-in view of the first macropixel
-        spin_to_zoom = 0 # Zoom on the first spin
-        row_zoom = spin_to_zoom // self._grid_cols
-        col_zoom = spin_to_zoom % self._grid_cols
-        x0_zoom = self._grid_offset_x + col_zoom * self._macro_pix_x
-        y0_zoom = self._grid_offset_y + row_zoom * self._macro_pix_y
-
-        zoomed_block = phase_mask[
-            y0_zoom : y0_zoom + self._macro_pix_y,
-            x0_zoom : x0_zoom + self._macro_pix_x
-        ]
+        spin_to_zoom = 0 
+        zoomed_block = phase_mask[self._spin_slices[spin_to_zoom]]
 
         im2 = axes[1].imshow(zoomed_block, cmap='twilight', interpolation='nearest', vmin=0, vmax=2*np.pi)
         axes[1].set_title(f'Zoom: Spin {spin_to_zoom}')
@@ -269,12 +279,19 @@ class CompensatedMattisInteractions:
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.show()
 
-    def run(self, spin_vector: List[int]):
+    def run(self, spin_vector: List[int], display_limit: int = 5):
         """
         A convenience method to prepare the model, then generate and display phase masks.
         """
-        #self.prep()
-        self.generate_phase_masks(spin_vector)
+        self.prep() # [REVIEW] Uncommented this line
+        all_masks = self.generate_phase_masks(spin_vector)
+        
+        print(f"Generated {len(all_masks)} phase masks.")
+        
+        if display_limit > 0:
+            print(f"Displaying first {min(display_limit, self.num_spins)} masks...")
+            for k in range(min(display_limit, self.num_spins)):
+                self._display_mask(all_masks[k], k)
 
 
 if __name__ == '__main__':
@@ -282,16 +299,14 @@ if __name__ == '__main__':
 
     # 1. Define the interaction matrix J for the spins
     NUM_SPINS = 40
-    # Example: Ferromagnetic coupling (all spins want to align)
-    J_ferro = np.ones((NUM_SPINS, NUM_SPINS))
     # Example: Random interaction matrix
     np.random.seed(42)
     J_random = np.random.randn(NUM_SPINS, NUM_SPINS)
     J_random = (J_random + J_random.T) / 2 # Ensure symmetry
 
     # 2. Define the experimental parameters
-    BEAM_SIGMA_X = 100  # Gaussian beam width in pixels
-    BEAM_SIGMA_Y = 100  # Gaussian beam height in pixels
+    BEAM_SIGMA_X = 600  # [REVIEW] Increased sigma to cover more spins
+    BEAM_SIGMA_Y = 600  # (Original 100 was very narrow for a 1920-wide SLM)
     SLM_WIDTH = 1920
     SLM_HEIGHT = 1080
 
@@ -305,9 +320,20 @@ if __name__ == '__main__':
     )
 
     # 4. Define a spin configuration to encode
-    # For this example, we'll use an alternating spin vector
     spin_config = [-1 if i % 2 else 1 for i in range(NUM_SPINS)]
 
     # 5. Run the process
-    # This will prepare the model and then generate and display the phase masks.
-    mattis_model.run(spin_vector=spin_config)
+    # [REVIEW] Call prep() and generate_phase_masks() explicitly
+    # for better control, or just use the .run() method.
+    
+    # Option 1: Use the run() method
+    mattis_model.run(spin_vector=spin_config, display_limit=3)
+
+    # Option 2: Manual control (good for notebooks)
+    # mattis_model.prep()
+    # all_masks = mattis_model.generate_phase_masks(spin_vector=spin_config)
+    # print(f"Generated {len(all_masks)} phase masks.")
+    #
+    # # Display the first 3 masks
+    # for k in range(min(3, NUM_SPINS)):
+    #     mattis_model._display_mask(all_masks[k], k)
