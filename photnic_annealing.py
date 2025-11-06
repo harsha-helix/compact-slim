@@ -38,7 +38,74 @@ except ImportError:
 
 # -----------------------------------------------------------------
 # 2. The Merged Photonic Annealer Class
-# -----------------------------------------------------------------
+# # -----------------------------------------------------------------
+# @numba.jit(nopython=True, cache=True)
+# def _compute_one_mask_numba(
+#     k: int,
+#     phase_mask: np.ndarray,             # (H, W) float32, modified in-place
+#     spin_phases: np.ndarray,            # (N,) float
+#     compensation_factors: np.ndarray,   # (N,) float
+#     eigvecs: np.ndarray,                # (N, N) float
+#     base_checkerboard: np.ndarray,      # (MH, MW) float32
+#     spin_x0: np.ndarray,                # (N,) int32
+#     spin_y0: np.ndarray,                # (N,) int32
+#     macro_pix_x: int,
+#     macro_pix_y: int,
+#     num_spins: int
+# ):
+#     """
+#     [Numba-JITted] Computes a single phase mask for eigenvector k.
+#     Modifies 'phase_mask' in-place.
+#     """
+    
+#     # 1. Calculate Amplitudes
+#     # Use explicit loops for Numba clarity
+#     target_amplitudes = np.empty(num_spins, dtype=np.float64)
+#     for i in range(num_spins):
+#         target_amplitudes[i] = compensation_factors[i] * eigvecs[i, k]
+
+#     # 2. Normalize
+#     max_abs_val = 0.0
+#     for i in range(num_spins):
+#         val = np.abs(target_amplitudes[i])
+#         if val > max_abs_val:
+#             max_abs_val = val
+    
+#     if max_abs_val < 1e-9:
+#         max_abs_val = 1.0
+
+#     # 3. Calculate Alphas
+#     alpha_ik = np.empty(num_spins, dtype=np.float64) 
+#     for i in range(num_spins):
+#         # Numba-safe clip
+#         val = target_amplitudes[i] / max_abs_val
+#         if val > 1.0:
+#             val = 1.0
+#         elif val < -1.0:
+#             val = -1.0
+#         alpha_ik[i] = np.arccos(val)
+
+#     # 4. Fill the phase mask
+#     two_pi = 2 * np.pi
+#     for i in range(num_spins):
+#         amplitude = alpha_ik[i]
+#         spin_phase = spin_phases[i]
+        
+#         # Get slice coordinates
+#         y_start = spin_y0[i]
+#         x_start = spin_x0[i]
+        
+#         # Create the macropixel block
+#         # Use explicit loops for assignment (safest in Numba)
+#         for y_idx in range(macro_pix_y):
+#             for x_idx in range(macro_pix_x):
+#                 # Calculate the phase for this pixel
+#                 val = spin_phase + (base_checkerboard[y_idx, x_idx] * amplitude)
+                
+#                 # Assign to the main mask with modulo
+#                 phase_mask[y_start + y_idx, x_start + x_idx] = val % two_pi
+    
+#     # No return value is needed, phase_mask is modified in-place
 
 class PhotonicAnnealer:
     """
@@ -186,7 +253,7 @@ class PhotonicAnnealer:
         # You can use a tiny timeout like 0.01 to yield CPU if you prefer.
         return serial.Serial(port=port, baudrate=baud, timeout=0)
 
-    def _photodiode_measurement_fast(ser: serial.Serial, duration: float = 0.05,
+    def _photodiode_measurement(ser: serial.Serial, duration: float = 0.05,
                                     adc_ref: Optional[float] = 3.3, adc_bits: int = 12):
         """
         Fast binary reader for frames: [0xA5][lo][hi] (3 bytes per sample).
