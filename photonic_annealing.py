@@ -123,9 +123,11 @@ class PhotonicAnnealer:
         J: np.ndarray,
         beam_sigma_x: float,
         beam_sigma_y: float,
-        serial_port: str = 'COM8',
+        serial_port: str = 'COM21',
         serial_baud: int = 115200,
+        serial_timeout: float = 0.001,
     ):
+
         """
         Initializes the annealer and connects to hardware.
 
@@ -140,9 +142,11 @@ class PhotonicAnnealer:
         
         # --- Hardware Handles ---
         self.slm: HEDS.SLM = None
-        self.ser: serial.Serial = None
+        self.ser: Optional[serial.Serial] = None
         self.serial_port = serial_port
         self.serial_baud = serial_baud
+        self.serial_timeout = serial_timeout
+
         
         # --- SLM Properties ---
         self.slm_width: int = 0
@@ -184,6 +188,21 @@ class PhotonicAnnealer:
 
         # --- Run Full Preparation ---
         self.prep()
+        # choose pool size (2 = double-buffering; 3 = safer for jitter)
+        self._buffer_pool_size = 4
+
+        # Pre-allocate buffers once SLM size is known (after _connect_hardware() & prep())
+        self._mask_buffers = [np.zeros((self.slm_height, self.slm_width), dtype=np.float32)
+                            for _ in range(self._buffer_pool_size)]
+
+        # Queues to manage buffer indices
+        self._free_buf_queue = queue.Queue()
+        self._filled_buf_queue = queue.Queue()
+
+        # Populate free queue with indices
+        for i in range(self._buffer_pool_size):
+            self._free_buf_queue.put(i)
+
 
     # ---------------------------------------------------
     # 1. Hardware Connection & Control
@@ -192,12 +211,12 @@ class PhotonicAnnealer:
     def _connect_hardware(self):
         """Initializes and connects to the HEDS SLM and Tiva Serial Port."""
         print("Connecting to hardware...")
-        
+
         # 1. Initialize SDK
         err = HEDS.SDK.Init(4, 1)
         if err != HEDSERR_NoError:
             raise RuntimeError(f"Error initializing SDK: {HEDS.SDK.ErrorString(err)}")
-        
+
         # 2. Initialize SLM (this may open the GUI)
         self.slm = HEDS.SLM.Init()
         if self.slm.errorCode() != HEDSERR_NoError:
@@ -209,12 +228,22 @@ class PhotonicAnnealer:
 
         # 3. Connect to Serial Port
         try:
-            self.ser = serial.Serial(self.serial_port, self.serial_baud, timeout=0.1)
-            time.sleep(1.0) # Wait for Tiva to boot/reset
-            self.ser.flushInput()
-            print(f"Serial port {self.serial_port} connected.")
+            # Use serial_timeout (0.0 => non-blocking) for fastest read behavior.
+            self.ser = serial.Serial(port=self.serial_port, baudrate=self.serial_baud, timeout=self.serial_timeout)
+            # Wait for device to reset / settle
+            time.sleep(1.0)
+            # Clear any buffered input
+            try:
+                self.ser.reset_input_buffer()
+            except AttributeError:
+                # older pyserial
+                self.ser.flushInput()
+            if self.ser.is_open:
+                print(f"Serial port {self.serial_port} opened at {self.serial_baud} baud (timeout={self.serial_timeout}).")
+            else:
+                raise RuntimeError(f"Serial port {self.serial_port} failed to open.")
         except serial.SerialException as e:
-            raise RuntimeError(f"Failed to connect to {self.serial_port}: {e}")
+            raise RuntimeError(f"Failed to connect to serial port {self.serial_port} at {self.serial_baud} baud: {e}")
 
     def disconnect_hardware(self):
         """Safely disconnects from SLM and Serial port."""
@@ -253,75 +282,62 @@ class PhotonicAnnealer:
         # You can use a tiny timeout like 0.01 to yield CPU if you prefer.
         return serial.Serial(port=port, baudrate=baud, timeout=0)
 
-    def _photodiode_measurement(ser: serial.Serial, duration: float = 0.05,
-                                    adc_ref: Optional[float] = 3.3, adc_bits: int = 12):
+    def _photodiode_measurement(self, duration: float = 0.05,
+                                adc_ref: Optional[float] = 3.3,
+                                adc_bits: int = 12):
         """
-        Fast binary reader for frames: [0xA5][lo][hi] (3 bytes per sample).
-        Returns average voltage (if adc_ref provided) or average raw counts.
+        Reads binary frames [0xA5][lo][hi] from self.ser (non-blocking).
+        Returns averaged voltage (if adc_ref) or average raw counts.
         """
+        ser = getattr(self, "ser", None)
+        if ser is None or not ser.is_open:
+            raise RuntimeError("Serial port not open. Call _connect_hardware() first.")
+
+        # Flush any stale data
+        try:
+            ser.reset_input_buffer()
+        except AttributeError:
+            ser.flushInput()
+
         buf = bytearray()
         start_time = time.perf_counter()
         sample_sum = 0
         sample_count = 0
         FRAME_SIZE = 3
         START_BYTE = 0xA5
-
-        # Pre-allocate a read buffer to reduce allocations
-        read_chunk_size = 4096  # tune larger if you expect big bursts
+        read_chunk_size = 512  # enough for 0.05 s @115200
 
         while time.perf_counter() - start_time < duration:
             chunk = ser.read(read_chunk_size)
-            if chunk:
-                buf.extend(chunk)
-
-                # Fast parser: find start byte and parse if full frame available
-                i = 0
-                # Use while loop to avoid slicing overhead
-                while i + FRAME_SIZE <= len(buf):
-                    if buf[i] != START_BYTE:
-                        # fast-skip to next possible start byte
-                        # find next occurrence to avoid byte-by-byte increment
-                        try:
-                            nxt = buf.index(START_BYTE, i + 1)
-                            i = nxt
-                        except ValueError:
-                            # no start byte found; drop processed bytes
-                            # keep last two bytes in case start byte arrives split
-                            del buf[:max(0, len(buf) - 2)]
-                            i = 0
-                            break
-                    else:
-                        # full frame available?
-                        if i + FRAME_SIZE <= len(buf):
-                            # parse uint16 little-endian from buf[i+1:i+3]
-                            lo = buf[i+1]
-                            hi = buf[i+2]
-                            val = lo | (hi << 8)
-                            sample_sum += val
-                            sample_count += 1
-                            i += FRAME_SIZE
-                        else:
-                            # incomplete frame — wait for more bytes
-                            break
-
-                # remove processed bytes from front
-                if i > 0:
-                    del buf[:i]
-            else:
-                # no data available right now - tiny sleep to avoid 100% CPU
-                # Use a very short sleep to remain responsive
+            if not chunk:
                 time.sleep(0.0005)
+                continue
+            buf.extend(chunk)
+            i = 0
+            while i + FRAME_SIZE <= len(buf):
+                if buf[i] != START_BYTE:
+                    i += 1
+                    continue
+                lo = buf[i + 1]
+                hi = buf[i + 2]
+                val = lo | (hi << 8)
+                sample_sum += val
+                sample_count += 1
+                i += FRAME_SIZE
+            if i > 0:
+                del buf[:i]
 
         if sample_count == 0:
-            # no data
-            return None
+            print("Warning: No photodiode data received.")
+            return getattr(self, "_last_photodiode_val", 0.0)
 
         avg_count = sample_sum / sample_count
         if adc_ref is not None:
-            max_counts = (1 << adc_bits) - 1
-            return (avg_count / max_counts) * adc_ref
+            val = (avg_count / ((1 << adc_bits) - 1)) * adc_ref
         else:
-            return avg_count
+            val = avg_count
+        self._last_photodiode_val = val
+        return val
 
 
     # ---------------------------------------------------
@@ -403,130 +419,182 @@ class PhotonicAnnealer:
     # ---------------------------------------------------
 
     def _generate_masks_streaming(self, spin_vector: np.ndarray):
-        """
-        [PRODUCER] This is a generator function that yields one mask at a time.
-        This runs on the producer thread.
-        """
-        # Pre-compute spin phases once
+        """Yields buffer indices (int) that contain completed masks."""
         spin_phases = np.where(spin_vector == 1, np.pi / 2, 3 * np.pi / 2)
-        
-        # Pre-allocate mask array to be re-used
-        phase_mask = np.zeros((self.slm_height, self.slm_width), dtype=np.float32)
 
-        for k in range(self.num_spins):
+        two_pi = 2 * np.pi
+        # Local references for speed
+        spin_slices = self._spin_slices
+        base_checkerboard = self._base_checkerboard
+        comp_factors = self._compensation_factors
+        eigvecs = self.eigvecs
+        n = self.num_spins
+
+        # Generator loop: compute mask k into a free buffer, then yield its index
+        for k in range(n):
             if self.stop_producer_event.is_set():
-                return # Stop generating if event is set
+                return
 
-            # --- Start Mask Computation (CPU-bound) ---
-            # Clear only the parts that will be written (more efficient)
-            # Or just re-use the array, it will be overwritten
-            
-            target_amplitudes = self._compensation_factors * self.eigvecs[:, k]
+            # 1) Acquire a free buffer index (will block if none available)
+            try:
+                buf_idx = self._free_buf_queue.get(timeout=1.0)
+            except queue.Empty:
+                # no free buffer — bail politely
+                print("Producer: timed out waiting for free buffer")
+                return
+
+            buf = self._mask_buffers[buf_idx]
+            # Fill buffer in-place (no new allocation)
+            # Option A: zero the full buffer first (optional)
+            # buf.fill(0.0)
+
+            # Compute target amplitudes & alpha (vectorized)
+            target_amplitudes = comp_factors * eigvecs[:, k]
             max_abs_val = np.max(np.abs(target_amplitudes))
             if max_abs_val < 1e-9:
                 max_abs_val = 1.0
-            
             normalized_amplitudes = np.clip(target_amplitudes / max_abs_val, -1.0, 1.0)
-
-            # Use the correct arccos logic
             alpha_ik = np.arccos(normalized_amplitudes)
 
-            for i in range(self.num_spins):
+            # Fill blocks
+            for i in range(n):
                 amplitude = alpha_ik[i]
                 spin_phase = spin_phases[i]
-                mask_slice = self._spin_slices[i]
-                
-                phi_block = spin_phase + (self._base_checkerboard * amplitude)
-                phase_mask[mask_slice] = phi_block % (2 * np.pi)
-            
-            # --- End Mask Computation ---
-            
-            # Yield the completed mask to the queue
-            yield phase_mask
+                ys, xs = spin_slices[i]
+                phi_block = spin_phase + (base_checkerboard * amplitude)
+                # In-place assignment to the preallocated buffer
+                buf[ys, xs] = phi_block % two_pi
+
+            # Put the buffer index into the filled queue for consumer to display
+            yield buf_idx
 
     def _producer_worker(self, spin_vector: np.ndarray):
-        """
-        [PRODUCER THREAD] Target function for the producer thread.
-        It runs the generator and 'puts' masks onto the queue.
-        """
         try:
-            mask_generator = self._generate_masks_streaming(spin_vector)
-            for mask in mask_generator:
+            for buf_idx in self._generate_masks_streaming(spin_vector):
                 if self.stop_producer_event.is_set():
                     break
-                # This line will block if the queue is full (size 5),
-                # waiting for the consumer to 'get' a mask.
-                self.mask_queue.put(mask)
+                # Put the ready buffer index into the filled queue
+                self._filled_buf_queue.put(buf_idx)
+        except Exception as e:
+            import traceback
+            print("Producer exception:", e)
+            traceback.print_exc()
         finally:
-            # Signal the end of the stream
-            self.mask_queue.put(None) 
+            # signal end
+            self._filled_buf_queue.put(None)
+
 
     def evaluate_energy(self, spin_vector: np.ndarray) -> float:
-        """
-        [CONSUMER] Evaluates the objective function for a given spin vector.
-        This now manages the producer-consumer threads.
-        """
-        
-        # --- 1. Start the Producer Thread ---
-        # Clear any old stop events and create a fresh queue
+        """Consumer: display each buffer provided by producer, measure PD, return energy."""
+        # Reset/prepare
         self.stop_producer_event.clear()
-        self.mask_queue = queue.Queue(maxsize=5) 
-        
+
+        # Start producer (daemon thread)
         self.producer_thread = threading.Thread(
             target=self._producer_worker,
-            args=(spin_vector,)
+            args=(spin_vector,),
+            daemon=True
         )
         self.producer_thread.start()
 
-        # --- 2. Run the Consumer (Main) Loop ---
         total_energy = 0.0
-        measurement_duration = 0.05 # [USER] Tune this
-        slm_wait_time = 0.05        # [USER] Tune this (SLM refresh time)
+        measurement_duration = 1.0 / 60.0
+        # short timeouts to detect producer failure quickly
+        filled_get_timeout = 2.0
+        free_put_timeout = 1.0
 
-        for k in range(self.num_spins):
-            # Get mask from queue (blocks until producer provides one)
-            phase_mask = self.mask_queue.get()
-            
-            if phase_mask is None:
-                # Producer finished early (shouldn't happen if k < num_spins)
-                print("Warning: Producer finished before all masks were measured.")
-                break
+        # Detect whether SDK supports background show flags or wait function:
+        USE_BACKGROUND_FLAG = getattr(HEDS, 'HEDSSlmShowPhaseFlags', None) is not None
+        has_wait_fn = hasattr(self.slm, 'waitForLastFrameDisplayed') or hasattr(self.slm, 'wait_for_frame')
 
-            # --- Display and Measure (I/O-bound) ---
-            if not self._display_phase_mask(phase_mask):
-                print(f"Error displaying mask k={k}. Stopping evaluation.")
-                total_energy = float('inf') # Return high energy
-                break
-                
-            time.sleep(slm_wait_time) # Wait for SLM to physically update
-            
-            measured_val = self._photodiode_measurement(duration=measurement_duration)
-            
-            if measured_val is None:
-                print(f"Error measuring mask k={k}. Stopping evaluation.")
-                total_energy = float('inf') # Return high energy
-                break
-                
-            total_energy += measured_val * self.eigvals[k]
-            # ---
-            # While this thread was sleeping and measuring,
-            # the producer thread was busy computing the *next* mask.
-            # ---
+        try:
+            for k in range(self.num_spins):
+                try:
+                    buf_idx = self._filled_buf_queue.get(timeout=filled_get_timeout)
+                except queue.Empty:
+                    print("Error: timed out waiting for a filled buffer from producer.")
+                    total_energy = float('inf')
+                    break
 
-        # --- 3. Cleanup ---
-        # Tell the producer to stop (if it's not already done)
-        self.stop_producer_event.set()
-        
-        # Drain the queue to unblock the producer if it's stuck on queue.put()
-        while not self.mask_queue.empty():
-            try:
-                self.mask_queue.get_nowait()
-            except queue.Empty:
-                break
-                
-        self.producer_thread.join() # Wait for the producer thread to exit
-        
-        #print(f"Energy: {total_energy:.4f}")
+                if buf_idx is None:
+                    # producer signalled end
+                    print("Warning: Producer finished before all masks were measured.")
+                    break
+
+                buf = self._mask_buffers[buf_idx]  # float32 preallocated buffer
+
+                # Display: avoid any copy here (buf is already float32)
+                # If SDK has background flag, use it; else rely on blocking showPhaseData
+                if USE_BACKGROUND_FLAG:
+                    # use SDK enum if available (this name may vary by SDK version)
+                    try:
+                        flags = HEDS.HEDSSlmShowPhaseFlags.SHOW_IN_BACKGROUND
+                        err = self.slm.showPhaseData(buf, flags)
+                    except Exception:
+                        # fallback to simple call
+                        err = self.slm.showPhaseData(buf)
+                else:
+                    err = self.slm.showPhaseData(buf)
+
+                if err != HEDSERR_NoError:
+                    print(f"Error displaying mask k={k}: {HEDS.SDK.ErrorString(err)}")
+                    total_energy = float('inf')
+                    # return buffer safely (best-effort)
+                    try:
+                        self._free_buf_queue.put(buf_idx, timeout=free_put_timeout)
+                    except Exception:
+                        pass
+                    break
+
+                # If SDK is async and provides a wait function, wait until SLM consumed this frame
+                if not hasattr(self.slm, 'showPhaseData') or (USE_BACKGROUND_FLAG and has_wait_fn):
+                    # call wait if available (names vary by SDK)
+                    wait_fn = getattr(self.slm, 'waitForLastFrameDisplayed', None) or getattr(self.slm, 'wait_for_frame', None)
+                    if callable(wait_fn):
+                        wait_fn()  # blocks until SLM finished reading/uploading frame
+
+                # Measure PD
+                measured_val = self._photodiode_measurement(duration=measurement_duration)
+                if measured_val is None:
+                    print(f"Error measuring mask k={k}.")
+                    total_energy = float('inf')
+                    # return buffer before breaking
+                    try:
+                        self._free_buf_queue.put(buf_idx, timeout=free_put_timeout)
+                    except Exception:
+                        pass
+                    break
+
+                # accumulate
+                total_energy += measured_val * self.eigvals[k]
+
+                # Return buffer to free pool now that display+measure completed
+                try:
+                    self._free_buf_queue.put(buf_idx, timeout=free_put_timeout)
+                except queue.Full:
+                    # improbable: if free queue full, drop it (producer will timeout waiting for free)
+                    pass
+
+        finally:
+            # Signal producer to stop (if still running) and join
+            self.stop_producer_event.set()
+            # join with timeout (avoid hang)
+            if self.producer_thread is not None:
+                self.producer_thread.join(timeout=3.0)
+
+            # Drain any leftover filled buffers and return them to free pool
+            while True:
+                try:
+                    item = self._filled_buf_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    break
+                try:
+                    self._free_buf_queue.put_nowait(item)
+                except queue.Full:
+                    pass
+
         return total_energy
 
     # ---------------------------------------------------
@@ -617,7 +685,7 @@ if __name__ == '__main__':
             J=J_random,
             beam_sigma_x=BEAM_SIGMA_X,
             beam_sigma_y=BEAM_SIGMA_Y,
-            serial_port='COM8' # [USER] Verify this port
+            serial_port='COM21' # [USER] Verify this port
         )
         
         # --- 5. Run the Annealing ---
