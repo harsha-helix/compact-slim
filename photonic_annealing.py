@@ -19,6 +19,10 @@ import queue
 # Numba
 import numba as nb
 import math
+import gc
+
+
+import collections, statistics
 
 # -----------------------------------------------------------------
 # 1. HOLOEYE SDK Setup
@@ -73,73 +77,6 @@ def fill_mask_blocks_numba(buf, base_checkerboard,
 # -----------------------------------------------------------------
 # 2. The Merged Photonic Annealer Class
 # # -----------------------------------------------------------------
-# @numba.jit(nopython=True, cache=True)
-# def _compute_one_mask_numba(
-#     k: int,
-#     phase_mask: np.ndarray,             # (H, W) float32, modified in-place
-#     spin_phases: np.ndarray,            # (N,) float
-#     compensation_factors: np.ndarray,   # (N,) float
-#     eigvecs: np.ndarray,                # (N, N) float
-#     base_checkerboard: np.ndarray,      # (MH, MW) float32
-#     spin_x0: np.ndarray,                # (N,) int32
-#     spin_y0: np.ndarray,                # (N,) int32
-#     macro_pix_x: int,
-#     macro_pix_y: int,
-#     num_spins: int
-# ):
-#     """
-#     [Numba-JITted] Computes a single phase mask for eigenvector k.
-#     Modifies 'phase_mask' in-place.
-#     """
-    
-#     # 1. Calculate Amplitudes
-#     # Use explicit loops for Numba clarity
-#     target_amplitudes = np.empty(num_spins, dtype=np.float64)
-#     for i in range(num_spins):
-#         target_amplitudes[i] = compensation_factors[i] * eigvecs[i, k]
-
-#     # 2. Normalize
-#     max_abs_val = 0.0
-#     for i in range(num_spins):
-#         val = np.abs(target_amplitudes[i])
-#         if val > max_abs_val:
-#             max_abs_val = val
-    
-#     if max_abs_val < 1e-9:
-#         max_abs_val = 1.0
-
-#     # 3. Calculate Alphas
-#     alpha_ik = np.empty(num_spins, dtype=np.float64) 
-#     for i in range(num_spins):
-#         # Numba-safe clip
-#         val = target_amplitudes[i] / max_abs_val
-#         if val > 1.0:
-#             val = 1.0
-#         elif val < -1.0:
-#             val = -1.0
-#         alpha_ik[i] = np.arccos(val)
-
-#     # 4. Fill the phase mask
-#     two_pi = 2 * np.pi
-#     for i in range(num_spins):
-#         amplitude = alpha_ik[i]
-#         spin_phase = spin_phases[i]
-        
-#         # Get slice coordinates
-#         y_start = spin_y0[i]
-#         x_start = spin_x0[i]
-        
-#         # Create the macropixel block
-#         # Use explicit loops for assignment (safest in Numba)
-#         for y_idx in range(macro_pix_y):
-#             for x_idx in range(macro_pix_x):
-#                 # Calculate the phase for this pixel
-#                 val = spin_phase + (base_checkerboard[y_idx, x_idx] * amplitude)
-                
-#                 # Assign to the main mask with modulo
-#                 phase_mask[y_start + y_idx, x_start + x_idx] = val % two_pi
-    
-#     # No return value is needed, phase_mask is modified in-place
 
 class PhotonicAnnealer:
     """
@@ -173,6 +110,10 @@ class PhotonicAnnealer:
             serial_baud (int): The baud rate for the serial connection.
         """
         print("Initializing Photonic Annealer...")
+
+        # --- Logging ---
+        self._timing_log = []  # list of dicts
+        self._timing_window = collections.deque(maxlen=1000)
         
         # --- Hardware Handles ---
         self.slm: HEDS.SLM = None
@@ -228,7 +169,7 @@ class PhotonicAnnealer:
         # --- Run Full Preparation ---
         self.prep()
         # choose pool size (2 = double-buffering; 3 = safer for jitter)
-        self._buffer_pool_size = 4
+        self._buffer_pool_size = 12
 
         # Pre-allocate buffers once SLM size is known (after _connect_hardware() & prep())
         self._mask_buffers = [np.zeros((self.slm_height, self.slm_width), dtype=np.float32)
@@ -584,7 +525,11 @@ class PhotonicAnnealer:
                 if self.stop_producer_event.is_set():
                     break
                 # Put the ready buffer index into the filled queue
-                self._filled_buf_queue.put(buf_idx)
+                # self._filled_buf_queue.put(buf_idx)
+                # when buffer is ready (immediately after buf is filled, or after loadPhaseData upload if you do that in producer)
+                t_ready = time.perf_counter()
+                # put a tuple (index, ready_time)
+                self._filled_buf_queue.put((buf_idx, t_ready))
         except Exception as e:
             import traceback
             print("Producer exception:", e)
@@ -596,6 +541,7 @@ class PhotonicAnnealer:
 
     def evaluate_energy(self, spin_vector: np.ndarray) -> float:
         """Consumer: display each buffer provided by producer, measure PD, return energy."""
+        
         # Reset/prepare
         self.stop_producer_event.clear()
 
@@ -619,8 +565,32 @@ class PhotonicAnnealer:
 
         try:
             for k in range(self.num_spins):
+                t_frame_start = time.perf_counter()
                 try:
-                    buf_idx = self._filled_buf_queue.get(timeout=filled_get_timeout)
+                    # buf_idx = self._filled_buf_queue.get(timeout=filled_get_timeout)
+                    item = self._filled_buf_queue.get(timeout=filled_get_timeout)
+                    if item is None:
+                        print("Warning: Producer finished before all masks were measured.")
+                        break
+
+                    # item may be either (buf_idx, t_ready) or just buf_idx (backwards compatibility)
+                    if isinstance(item, tuple):
+                        buf_idx, t_ready = item
+                    else:
+                        buf_idx = item
+                        t_ready = None
+
+                    buf = self._mask_buffers[buf_idx]
+
+                    # Timing
+                    t_frame_start = time.perf_counter()
+                    if t_ready is None:
+                        # mark mask_ready as unknown (producer didn't provide)
+                        mask_ready = None
+                    else:
+                        # time since producer finished preparing this buffer
+                        mask_ready = t_frame_start - t_ready
+
                 except queue.Empty:
                     print("Error: timed out waiting for a filled buffer from producer.")
                     total_energy = float('inf')
@@ -632,6 +602,8 @@ class PhotonicAnnealer:
                     break
 
                 buf = self._mask_buffers[buf_idx]  # float32 preallocated buffer
+                # --- ⏱️ BEFORE SHOW ---
+                t_before_show = time.perf_counter()
 
                 # Display: avoid any copy here (buf is already float32)
                 # If SDK has background flag, use it; else rely on blocking showPhaseData
@@ -663,6 +635,8 @@ class PhotonicAnnealer:
                     if callable(wait_fn):
                         wait_fn()  # blocks until SLM finished reading/uploading frame
 
+                t_after_show = time.perf_counter()
+
                 # Measure PD
                 # measured_val = self._photodiode_measurement(duration=measurement_duration)
                 with  self._pd_lock:
@@ -677,8 +651,36 @@ class PhotonicAnnealer:
                         pass
                     break
 
+                t_after_pd = time.perf_counter()
+
+
+
                 # accumulate
                 total_energy += measured_val * self.eigvals[k]
+
+                t_frame_end = time.perf_counter()
+
+                                # === Record timing info ===
+                frame_info = {
+                    "k": k,
+                    "mask_ready": mask_ready,
+                    "show_time": t_after_show - t_before_show,
+                    "pd_time": t_after_pd - t_after_show,
+                    "frame_total": t_frame_end - t_frame_start,
+                    "timestamp": t_frame_start,
+                }
+                self._timing_log.append(frame_info)
+                self._timing_window.append(frame_info)
+
+                # Every 100 frames print summary
+                if len(self._timing_log) % 100 == 0:
+                    totals = [f["frame_total"] for f in self._timing_window if f["frame_total"] is not None]
+                    show_times = [f["show_time"] for f in self._timing_window]
+                    mask_ready_times = [f["mask_ready"] for f in self._timing_window if f["mask_ready"] is not None]
+                    print(f"[Timing] frames={len(totals)} avg={statistics.mean(totals)*1000:.2f} ms  std={statistics.stdev(totals)*1000:.2f} ms  "
+                        f"show_avg={statistics.mean(show_times)*1000:.2f} ms  show_std={statistics.stdev(show_times)*1000:.2f} ms "
+                        + (f"mask_ready_avg={statistics.mean(mask_ready_times)*1000:.2f} ms" if mask_ready_times else ""))
+
 
                 # Return buffer to free pool now that display+measure completed
                 try:
@@ -717,6 +719,13 @@ class PhotonicAnnealer:
         """
         Performs the simulated annealing algorithm.
         """
+        
+        gc_disabled = False
+        try:
+            gc.disable()
+            gc_disabled = True
+        except Exception:
+            pass
         current_spin_vector = np.random.choice([-1, 1], size=self.num_spins)
         
         print("Evaluating initial random spin configuration...")
@@ -746,7 +755,7 @@ class PhotonicAnnealer:
                 if delta_energy < 0 or random.random() < math.exp(-delta_energy / temp):
                     current_spin_vector = proposed_spin_vector
                     current_energy = proposed_energy
-                    print(f"  Step {step+1}/{steps_per_temp} | New Energy Accepted: {current_energy:.4f}")
+                    # print(f"  Step {step+1}/{steps_per_temp} | New Energy Accepted: {current_energy:.4f}")
                 
                 energy_plot.append(current_energy)
 
@@ -757,6 +766,8 @@ class PhotonicAnnealer:
         print("\nSimulated annealing finished.")
         total_time = time.time() - annealing_start_time
         print(f"Total time taken: {total_time:.2f} seconds")
+        if gc_disabled:
+            gc.enable()
         
         # Plot the results
         plt.figure(figsize=(10, 6))
