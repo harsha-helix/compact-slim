@@ -16,6 +16,10 @@ from typing import Optional
 import threading
 import queue
 
+# Numba
+import numba as nb
+import math
+
 # -----------------------------------------------------------------
 # 1. HOLOEYE SDK Setup
 # -----------------------------------------------------------------
@@ -35,6 +39,36 @@ except ImportError:
     print(f"FATAL ERROR: Could not import HEDS library from {python_api_path}")
     print("Please verify the 'sdk_install_path' variable in this script.")
     sys.exit(1)
+
+########### Numba functions ###########
+@nb.njit(parallel=True, cache=True)
+def fill_mask_blocks_numba(buf, base_checkerboard,
+                           alpha_ik, spin_phases,
+                           spin_y0, spin_x0,
+                           macro_pix_y, macro_pix_x):
+    """
+    Numba-compiled mask filler.
+    - buf: 2D float32 array (SLM height x width)
+    - base_checkerboard: 2D float32 array (macro_pix_y x macro_pix_x)
+    - alpha_ik: 1D float32 length n_spins
+    - spin_phases: 1D float32 length n_spins
+    - spin_y0, spin_x0: 1D int32 start coords (length n_spins)
+    - macro_pix_y, macro_pix_x: ints
+    """
+    two_pi = 2.0 * math.pi
+    n = alpha_ik.shape[0]
+
+    # iterate spins in parallel
+    for i in nb.prange(n):
+        amplitude = alpha_ik[i]
+        spin_phase = spin_phases[i]
+        y0 = spin_y0[i]
+        x0 = spin_x0[i]
+        # inner block fill
+        for yy in range(macro_pix_y):
+            for xx in range(macro_pix_x):
+                val = spin_phase + base_checkerboard[yy, xx] * amplitude
+                buf[y0 + yy, x0 + xx] = val % two_pi
 
 # -----------------------------------------------------------------
 # 2. The Merged Photonic Annealer Class
@@ -224,6 +258,7 @@ class PhotonicAnnealer:
             raise RuntimeError(f"Error initializing SDK: {HEDS.SDK.ErrorString(err)}")
 
         # 2. Initialize SLM (this may open the GUI)
+        
         self.slm = HEDS.SLM.Init()
         if self.slm.errorCode() != HEDSERR_NoError:
             raise RuntimeError(f"Error initializing SLM: {HEDS.SDK.ErrorString(self.slm.errorCode())}")
@@ -454,13 +489,21 @@ class PhotonicAnnealer:
             self._spin_coords_x[i] = x0 + self._macro_pix_x / 2
             self._spin_coords_y[i] = y0 + self._macro_pix_y / 2
             self._spin_slices.append((slice(y0, y0 + self._macro_pix_y), slice(x0, x0 + self._macro_pix_x)))
+        self._spin_y0 = np.empty(self.num_spins, dtype=np.int32)
+        self._spin_x0 = np.empty(self.num_spins, dtype=np.int32)
+        for i, (ys, xs) in enumerate(self._spin_slices):
+            # slice.start should be int
+            self._spin_y0[i] = int(ys.start)
+            self._spin_x0[i] = int(xs.start)
 
     def _precompute_checkerboard(self):
         """Pre-computes the base checkerboard pattern once."""
-        lx = np.arange(self._macro_pix_x)
-        ly = np.arange(self.slm_height // self._grid_rows) # Use floored height
+        lx = np.arange(self._macro_pix_x, dtype=np.int32)
+        ly = np.arange(self._macro_pix_y, dtype=np.int32)
         lx_grid, ly_grid = np.meshgrid(lx, ly)
+        # checkerboard values as float32
         self._base_checkerboard = ((-1)**(lx_grid + ly_grid)).astype(np.float32)
+
 
     def _compute_compensation_factors(self):
         """Computes compensation factors (1/sqrt(I)) vectorized."""
@@ -518,13 +561,19 @@ class PhotonicAnnealer:
             alpha_ik = np.arccos(normalized_amplitudes)
 
             # Fill blocks
-            for i in range(n):
-                amplitude = alpha_ik[i]
-                spin_phase = spin_phases[i]
-                ys, xs = spin_slices[i]
-                phi_block = spin_phase + (base_checkerboard * amplitude)
-                # In-place assignment to the preallocated buffer
-                buf[ys, xs] = phi_block % two_pi
+# Numba-accelerated block fill (single call)
+# Ensure dtypes: buf float32, base_checkerboard float32, alpha_ik float32, spin_phases float32, spin_y0/x0 int32
+            fill_mask_blocks_numba(
+                buf,
+                base_checkerboard,
+                alpha_ik.astype(np.float32),
+                spin_phases.astype(np.float32),
+                self._spin_y0,
+                self._spin_x0,
+                self._macro_pix_y,
+                self._macro_pix_x
+            )
+
 
             # Put the buffer index into the filled queue for consumer to display
             yield buf_idx
