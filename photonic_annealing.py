@@ -151,7 +151,12 @@ class PhotonicAnnealer:
         # --- SLM Properties ---
         self.slm_width: int = 0
         self.slm_height: int = 0
-        
+        # --- Photodiode Reading Thread ---
+
+        self._pd_thread = None
+        self._pd_stop_event = threading.Event()
+        self._pd_lock = threading.Lock()
+        self._last_photodiode_val = 0.0        
         # --- Connect to Hardware ---
         self._connect_hardware()
 
@@ -204,6 +209,7 @@ class PhotonicAnnealer:
             self._free_buf_queue.put(i)
 
 
+
     # ---------------------------------------------------
     # 1. Hardware Connection & Control
     # ---------------------------------------------------
@@ -244,6 +250,7 @@ class PhotonicAnnealer:
                 raise RuntimeError(f"Serial port {self.serial_port} failed to open.")
         except serial.SerialException as e:
             raise RuntimeError(f"Failed to connect to serial port {self.serial_port} at {self.serial_baud} baud: {e}")
+        self.start_pd_thread()
 
     def disconnect_hardware(self):
         """Safely disconnects from SLM and Serial port."""
@@ -259,6 +266,60 @@ class PhotonicAnnealer:
         if self.ser is not None and self.ser.is_open:
             self.ser.close()
             print(f"Serial port {self.serial_port} closed.")
+        self.stop_pd_thread()
+
+    def _pd_reader_worker(self):
+        """Continuously read frames from serial and update self._last_photodiode_val."""
+        ser = getattr(self, "ser", None)
+        if ser is None or not ser.is_open:
+            return
+        buf = bytearray()
+        FRAME_SIZE = 3
+        START_BYTE = 0xA5
+        while not self._pd_stop_event.is_set():
+            try:
+                chunk = ser.read(512)  # non-blocking or very short timeout
+            except Exception:
+                time.sleep(0.0005)
+                continue
+            if not chunk:
+                # yield CPU briefly
+                time.sleep(0.0002)
+                continue
+            buf.extend(chunk)
+            i = 0
+            updated = False
+            while i + FRAME_SIZE <= len(buf):
+                if buf[i] != START_BYTE:
+                    i += 1
+                    continue
+                lo = buf[i+1]
+                hi = buf[i+2]
+                val = lo | (hi << 8)
+                # convert to voltage if desired here (cheap math)
+                with self._pd_lock:
+                    self._last_photodiode_val = (val / ((1 << 12) - 1)) * 3.3  # change adc params if needed
+                updated = True
+                i += FRAME_SIZE
+            if i > 0:
+                del buf[:i]
+            if not updated:
+                # allow small sleep to avoid busy spin
+                time.sleep(0.0002)
+
+    def start_pd_thread(self):
+        if self._pd_thread is not None and self._pd_thread.is_alive():
+            return
+        self._pd_stop_event.clear()
+        self._pd_thread = threading.Thread(target=self._pd_reader_worker, daemon=True)
+        self._pd_thread.start()
+
+    def stop_pd_thread(self):
+        if self._pd_thread is None:
+            return
+        self._pd_stop_event.set()
+        self._pd_thread.join(timeout=1.0)
+        self._pd_thread = None
 
     def _display_phase_mask(self, phase_mask_2d: np.ndarray) -> bool:
         """(Internal) Displays a 2D NumPy array on the SLM."""
@@ -554,7 +615,9 @@ class PhotonicAnnealer:
                         wait_fn()  # blocks until SLM finished reading/uploading frame
 
                 # Measure PD
-                measured_val = self._photodiode_measurement(duration=measurement_duration)
+                # measured_val = self._photodiode_measurement(duration=measurement_duration)
+                with  self._pd_lock:
+                    measured_val = self._last_photodiode_val
                 if measured_val is None:
                     print(f"Error measuring mask k={k}.")
                     total_energy = float('inf')
