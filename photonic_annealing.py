@@ -6,41 +6,98 @@ import math
 import time
 import serial
 import matplotlib.pyplot as plt
-from typing import Tuple, List
-import time
-import struct
-import serial
-from typing import Optional
-
-# --- [NEW] Imports for FIFO Streaming ---
+from typing import Tuple, List, Optional, Union
 import threading
 import queue
+import struct
+from abc import ABC, abstractmethod # Import for Abstract Base Class
+import collections
 
 # Numba
-import numba as nb
-import math
+try:
+    import numba as nb
+except ImportError:
+    print("Warning: Numba not installed. Performance will be significantly reduced.")
+    print("Install with: pip install numba")
+    # Create dummy decorator if numba is not present
+    class DummyNumba:
+        def njit(self, *args, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+        def prange(self, *args):
+            return range(*args)
+    nb = DummyNumba()
 
 # -----------------------------------------------------------------
 # 1. HOLOEYE SDK Setup
 # -----------------------------------------------------------------
 
 # [USER] PLEASE VERIFY THIS PATH
-sdk_install_path = r"C:\Program Files\HOLOEYE Photonics\SLM Display SDK (Python) v4.1.0"
+# sdk_install_path = r"C:\Program Files\HOLOEYE Photonics\SLM Display SDK (Python) v4.1.0"
+# # --- Use a relative path or environment variable for better portability ---
+sdk_install_path = os.environ.get("HOLOEYE_SDK_PATH", r"C:\Program Files\HOLOEYE Photonics\SLM Display SDK (Python) v4.1.0")
 python_api_path = os.path.join(sdk_install_path, "api", "python")
 
 if python_api_path not in sys.path:
-    sys.path.append(python_api_path)
-    print(f"Added {python_api_path} to Python path.")
+    if os.path.exists(python_api_path):
+        sys.path.append(python_api_path)
+        print(f"Added {python_api_path} to Python path.")
+    else:
+        print(f"Warning: Holoeye SDK path not found at {python_api_path}")
+        print("Please verify the 'sdk_install_path' variable or set HOLOEYE_SDK_PATH environment variable.")
+
 
 try:
     import HEDS
     from hedslib.heds_types import *
 except ImportError:
     print(f"FATAL ERROR: Could not import HEDS library from {python_api_path}")
-    print("Please verify the 'sdk_install_path' variable in this script.")
-    sys.exit(1)
+    print("This script will not be able to connect to the SLM.")
+    # We won't exit, to allow for "offline" testing if HEDS is mocked
+    HEDS = None
+    HEDSERR_NoError = 0 # Define dummy error code
 
-########### Numba functions ###########
+# -----------------------------------------------------------------
+# 2. Global Numba Functions
+# -----------------------------------------------------------------
+
+@nb.njit(parallel=True, cache=True)
+def fill_mask_uint8(buf, base_checkerboard,
+                    alpha_ik, spin_phases,
+                    spin_y0, spin_x0,
+                    macro_pix_y, macro_pix_x):
+    """
+    Optimized filler for UINT8 buffers. 
+    Maps phase 0..2pi -> 0..255 integers.
+    """
+    scale = 255.0 / (2.0 * math.pi)
+    n = alpha_ik.shape[0]
+
+    # Iterate spins in parallel
+    for i in nb.prange(n):
+        amplitude = alpha_ik[i]
+        spin_phase = spin_phases[i]
+        y0 = spin_y0[i]
+        x0 = spin_x0[i]
+        
+        # Calculate values for +1 and -1 checkerboard entries
+        # val = (spin_phase + checker * amplitude)
+        val_plus = (spin_phase + amplitude) * scale
+        val_minus = (spin_phase - amplitude) * scale
+        
+        # Fast modulo 256 logic for uint8 wrapping
+        v_p = int(val_plus) % 256
+        v_m = int(val_minus) % 256
+        
+        for yy in range(macro_pix_y):
+            for xx in range(macro_pix_x):
+                # Checkerboard logic: (-1)^(x+y)
+                if base_checkerboard[yy, xx] > 0:
+                    buf[y0 + yy, x0 + xx] = v_p
+                else:
+                    buf[y0 + yy, x0 + xx] = v_m
+
 @nb.njit(parallel=True, cache=True)
 def fill_mask_blocks_numba(buf, base_checkerboard,
                            alpha_ik, spin_phases,
@@ -71,460 +128,125 @@ def fill_mask_blocks_numba(buf, base_checkerboard,
                 buf[y0 + yy, x0 + xx] = val % two_pi
 
 # -----------------------------------------------------------------
-# 2. The Merged Photonic Annealer Class
-# # -----------------------------------------------------------------
-# @numba.jit(nopython=True, cache=True)
-# def _compute_one_mask_numba(
-#     k: int,
-#     phase_mask: np.ndarray,             # (H, W) float32, modified in-place
-#     spin_phases: np.ndarray,            # (N,) float
-#     compensation_factors: np.ndarray,   # (N,) float
-#     eigvecs: np.ndarray,                # (N, N) float
-#     base_checkerboard: np.ndarray,      # (MH, MW) float32
-#     spin_x0: np.ndarray,                # (N,) int32
-#     spin_y0: np.ndarray,                # (N,) int32
-#     macro_pix_x: int,
-#     macro_pix_y: int,
-#     num_spins: int
-# ):
-#     """
-#     [Numba-JITted] Computes a single phase mask for eigenvector k.
-#     Modifies 'phase_mask' in-place.
-#     """
-    
-#     # 1. Calculate Amplitudes
-#     # Use explicit loops for Numba clarity
-#     target_amplitudes = np.empty(num_spins, dtype=np.float64)
-#     for i in range(num_spins):
-#         target_amplitudes[i] = compensation_factors[i] * eigvecs[i, k]
+# 3. Abstract Base Class: PhotonicAnnealer
+# -----------------------------------------------------------------
 
-#     # 2. Normalize
-#     max_abs_val = 0.0
-#     for i in range(num_spins):
-#         val = np.abs(target_amplitudes[i])
-#         if val > max_abs_val:
-#             max_abs_val = val
-    
-#     if max_abs_val < 1e-9:
-#         max_abs_val = 1.0
-
-#     # 3. Calculate Alphas
-#     alpha_ik = np.empty(num_spins, dtype=np.float64) 
-#     for i in range(num_spins):
-#         # Numba-safe clip
-#         val = target_amplitudes[i] / max_abs_val
-#         if val > 1.0:
-#             val = 1.0
-#         elif val < -1.0:
-#             val = -1.0
-#         alpha_ik[i] = np.arccos(val)
-
-#     # 4. Fill the phase mask
-#     two_pi = 2 * np.pi
-#     for i in range(num_spins):
-#         amplitude = alpha_ik[i]
-#         spin_phase = spin_phases[i]
-        
-#         # Get slice coordinates
-#         y_start = spin_y0[i]
-#         x_start = spin_x0[i]
-        
-#         # Create the macropixel block
-#         # Use explicit loops for assignment (safest in Numba)
-#         for y_idx in range(macro_pix_y):
-#             for x_idx in range(macro_pix_x):
-#                 # Calculate the phase for this pixel
-#                 val = spin_phase + (base_checkerboard[y_idx, x_idx] * amplitude)
-                
-#                 # Assign to the main mask with modulo
-#                 phase_mask[y_start + y_idx, x_start + x_idx] = val % two_pi
-    
-#     # No return value is needed, phase_mask is modified in-place
-
-class PhotonicAnnealer:
+class PhotonicAnnealer(ABC):
     """
-    Manages the entire Photonic Ising Machine experiment.
+    Abstract Base Class for a Photonic Ising Machine.
 
-    This class handles:
-    - Hardware connection (SLM, Photodiode).
-    - Mattis Hamiltonian decomposition and beam compensation.
-    - High-performance, streaming (FIFO) phase mask generation.
-    - The simulated annealing optimization loop.
+    Manages hardware connection (SLM, Photodiode), beam layout,
+    and high-performance, streaming (FIFO) phase mask generation.
+
+    Child classes must implement problem-specific logic:
+    - _perform_eigendecomposition()
+    - evaluate_energy()
+    - run_annealing()
     """
-    
+
     def __init__(
         self,
-        J: np.ndarray,
         beam_sigma_x: float,
         beam_sigma_y: float,
         serial_port: str = 'COM21',
         serial_baud: int = 115200,
         serial_timeout: float = 0.001,
+        use_uint8: bool = True
     ):
-
         """
         Initializes the annealer and connects to hardware.
 
         Args:
-            J (np.ndarray): The n_spins x n_spins interaction matrix.
             beam_sigma_x (float): Gaussian beam std dev in x.
             beam_sigma_y (float): Gaussian beam std dev in y.
             serial_port (str): The COM port for the Tiva microcontroller.
             serial_baud (int): The baud rate for the serial connection.
         """
-        print("Initializing Photonic Annealer...")
-        
+        print("Initializing Photonic Annealer Base...")
+        if HEDS is None:
+            print("WARNING: HEDS SDK not loaded. SLM will not function.")
+        self.stats = {
+                    'mask_gen': 0.0,      # Time to produce 1 mask (Math)
+                    'buffer_upload': 0.0, # Time to upload to GPU/SLM (API)
+                    'slm_show': 0.0,      # Time to trigger display
+                    'measurement': 0.0,   # Time for PD settle + Read
+                    'queue_wait': 0.0,    # Dead time (Consumer waiting for Producer)
+                    'producer_wait': 0.0, # Dead time (Producer waiting for Free Buffer)
+                    'count_masks': 0,
+                    'count_evals': 0
+                }
         # --- Hardware Handles ---
-        self.slm: HEDS.SLM = None
+        self.use_uint8 = use_uint8 # <--- STORE FLAG
+        self.sync_slm = True # Synchronous SLM display by default
+        self.slm: Optional[HEDS.SLM] = None
         self.ser: Optional[serial.Serial] = None
         self.serial_port = serial_port
         self.serial_baud = serial_baud
         self.serial_timeout = serial_timeout
 
-        
         # --- SLM Properties ---
-        self.slm_width: int = 0
-        self.slm_height: int = 0
-        # --- Photodiode Reading Thread ---
+        self.slm_width: int = 1920 # Default, will be overwritten
+        self.slm_height: int = 1080 # Default, will be overwritten
 
-        self._pd_thread = None
+        # --- Photodiode Reading Thread ---
+        self._pd_thread: Optional[threading.Thread] = None
         self._pd_stop_event = threading.Event()
         self._pd_lock = threading.Lock()
-        self._last_photodiode_val = 0.0        
-        # --- Connect to Hardware ---
-        self._connect_hardware()
+        self._last_pd_raw = 0.0
+        self._last_pd_avg = 0.0
+        self._pd_buffer = collections.deque(maxlen=80) 
+        self._last_photodiode_val: float = 0.0
 
-        # --- Ising Model Properties ---
-        if not isinstance(J, np.ndarray) or J.ndim != 2 or J.shape[0] != J.shape[1]:
-            raise ValueError("J must be a square 2D numpy array.")
-        if not np.allclose(J, J.T):
-            raise ValueError("Interaction matrix J is not symmetric.")
-            
-        self.J = J
-        self.num_spins = J.shape[0]
+        # --- Ising Model Properties (to be set by child) ---
+        self.J: np.ndarray = np.empty((0, 0))
+        self.num_spins: int = 0
         self.beam_sigma_x = beam_sigma_x
         self.beam_sigma_y = beam_sigma_y
+        self.eigvals: np.ndarray = np.empty(0)
+        self.eigvecs: np.ndarray = np.empty((0, 0))
+        self._active_modes: List[int] = []
+
+        # --- Connect to Hardware ---
+        # Child __init__ must set num_spins *before* calling prep()
+        self._connect_hardware()
 
         # --- FIFO Streaming Attributes ---
-        self.mask_queue = queue.Queue(maxsize=5) # Max 5 masks in RAM
-        self.producer_thread = None
-        self.stop_producer_event = threading.Event()
+        self._buffer_pool_size = 10 # choose pool size
+        dtype = np.uint8 if self.use_uint8 else np.float32
         
-        # --- Pre-computation Attributes ---
+        self._mask_buffers: List[np.ndarray] = [
+            np.zeros((self.slm_height, self.slm_width), dtype=dtype)
+            for _ in range(self._buffer_pool_size)
+        ]
+        self._handle_lock = threading.Lock()
+        self._handle_pool: List[Optional[HEDS.SLMDataHandle]] = [None] * self._buffer_pool_size
+        self._free_buf_queue = queue.Queue(maxsize=self._buffer_pool_size)
+        self._filled_buf_queue = queue.Queue(maxsize=self._buffer_pool_size + 2)
+        self._reset_buffer_queues()
+
+        self.producer_thread: Optional[threading.Thread] = None
+        self.stop_producer_event = threading.Event()
+
+        # --- Pre-computation Attributes (to be set by prep) ---
         self._center_x: float = self.slm_width / 2
         self._center_y: float = self.slm_height / 2
-        self.eigvals: np.ndarray = None
-        self.eigvecs: np.ndarray = None
         self._grid_rows: int = 0
         self._grid_cols: int = 0
         self._macro_pix_x: int = 0
         self._macro_pix_y: int = 0
-        self._compensation_factors: np.ndarray = None
-        self._base_checkerboard: np.ndarray = None
-        self._spin_slices: List[Tuple[slice, slice]] = []
-        self._spin_coords_x: np.ndarray = np.zeros(self.num_spins)
-        self._spin_coords_y: np.ndarray = np.zeros(self.num_spins)
+        self._compensation_factors: np.ndarray = np.empty(0)
+        self._base_checkerboard: np.ndarray = np.empty((0, 0))
+        self._spin_y0: np.ndarray = np.empty(0, dtype=np.int32)
+        self._spin_x0: np.ndarray = np.empty(0, dtype=np.int32)
+        self._spin_coords_x: np.ndarray = np.empty(0)
+        self._spin_coords_y: np.ndarray = np.empty(0)
+        self._alpha_matrix: np.ndarray = np.empty((0, 0))
+        self.beamcomp: bool = True
+         # For diagnostics
 
-        # --- Run Full Preparation ---
-        self.prep()
-        # choose pool size (2 = double-buffering; 3 = safer for jitter)
-        self._buffer_pool_size = 10
-
-        # Pre-allocate buffers once SLM size is known (after _connect_hardware() & prep())
-        self._mask_buffers = [np.zeros((self.slm_height, self.slm_width), dtype=np.float32)
-                            for _ in range(self._buffer_pool_size)]
-        
-        self._reset_buffer_queues()
-        # Queues to manage buffer indices
-        self._free_buf_queue = queue.Queue()
-        self._filled_buf_queue = queue.Queue()
-
-        # Populate free queue with indices
-        for i in range(self._buffer_pool_size):
-            self._free_buf_queue.put(i)
-        # --- Buffer / handle pool initialization (required) ---
-        # choose buffer pool size earlier: self._buffer_pool_size already set
-        # ensure a sane size if not
-        try:
-            self._buffer_pool_size = int(getattr(self, "_buffer_pool_size", max(10, (os.cpu_count() or 4) * 2)))
-        except Exception:
-            self._buffer_pool_size = max(10, (os.cpu_count() or 4) * 2)
-
-        # Pre-allocate masks (already present in your file; this is safe if repeated)
-        self._mask_buffers = [np.zeros((self.slm_height, self.slm_width), dtype=np.float32)
-                            for _ in range(self._buffer_pool_size)]
-        self._init_handle_pool()
-        self._init_handle_pool()
-
-        # create lock used whenever we touch handle pool
-        self._handle_lock = threading.Lock()
-
-        # create a handle pool aligned with mask buffers
-        self._handle_pool = [None] * len(self._mask_buffers)
-
-        # create and populate free/filled queues (safe reset)
-        def _local_reset_queues():
-            self._free_buf_queue = queue.Queue(maxsize=len(self._mask_buffers))
-            self._filled_buf_queue = queue.Queue(maxsize=len(self._mask_buffers) + 2)
-            for i in range(len(self._mask_buffers)):
-                try:
-                    self._free_buf_queue.put_nowait(i)
-                except queue.Full:
-                    break
-
-        _local_reset_queues()
-
-        # Optional: pre-upload empty buffers as handles (fast path for show-by-handle)
-        try:
-            # upload handles in background — this uses your safe wrapper
-            self._upload_buffer_pool_as_handles()
-        except Exception as e:
-            print("Warning: initial upload of handle pool failed:", e)
-        # ---------------------------
-        # Insert into PhotonicAnnealer.__init__ AFTER you create self._mask_buffers
-        # ---------------------------
-        # (Place this line right after you create self._mask_buffers)
-        
-        # then upload initial buffers as handles (best-effort)
+        # Upload initial empty buffers as handles
         self._upload_buffer_pool_as_handles()
-        # ---------------------------
-
-    # ---------------------------
-    # New / replacement methods for handle management
-    # ---------------------------
-
-    def _init_handle_pool(self):
-        """Create thread-safe structures for the handle pool."""
-        # Called after self._mask_buffers exists and self._buffer_pool_size is set
-        self._handle_lock = threading.Lock()
-        # initialize handle pool to same length as buffers
-        self._handle_pool = [None] * len(self._mask_buffers)
-
-    def _safe_load_phase_data(self, buf: np.ndarray):
-        """
-        Upload 'buf' to the SLM and return an SLMDataHandle on success, or None on failure.
-        Wraps SDK differences and common error cases.
-        """
-        if self.slm is None:
-            return None
-
-        try:
-            # The SDK wrapper typically returns (err, SLMDataHandle)
-            maybe = self.slm.loadPhaseData(buf)
-        except Exception as e:
-            # some wrappers may raise on internal error
-            print("Producer: loadPhaseData exception:", e)
-            return None
-
-        # normalize wrapper return formats
-        dh = None
-        try:
-            # common pattern: (err, data_handle) or (err, data_handle_id)
-            if isinstance(maybe, tuple) or isinstance(maybe, list):
-                if len(maybe) >= 2:
-                    err = maybe[0]
-                    cand = maybe[1]
-                    # if the wrapper gave an SLMDataHandle object, use it
-                    if hasattr(cand, "id") or hasattr(cand, "_handle_id") or cand is not None:
-                        dh = cand
-                    else:
-                        dh = None
-                elif len(maybe) == 1:
-                    # maybe returned only handle
-                    dh = maybe[0]
-                else:
-                    dh = None
-            else:
-                # some wrapper versions directly return an SLMDataHandle
-                dh = maybe
-        except Exception:
-            dh = None
-
-        # If we got a handle-like object, ensure it exposes expected API
-        if dh is None:
-            return None
-
-        # If it's an SLMDataHandle object in this SDK, it should have applyErrorCode/errorCode etc.
-        # We return the handle object for later usage.
-        return dh
-
-    def _release_handle(self, handle):
-        """
-        Try to release an SLM data-handle if SDK exposes a release/free function.
-        Best-effort; swallowing exceptions keeps system robust.
-        """
-        if handle is None:
-            return
-        try:
-            # Preferred: call object's release() if exposed in this wrapper
-            rel = getattr(handle, "release", None)
-            if callable(rel):
-                try:
-                    rel()
-                    return
-                except Exception:
-                    pass
-
-            # Some wrappers implement different names - try common ones
-            rel2 = getattr(handle, "free", None)
-            if callable(rel2):
-                try:
-                    rel2()
-                    return
-                except Exception:
-                    pass
-
-            # Fallback: try to extract low-level id and call SDK free api (best-effort)
-            handle_id = None
-            try:
-                handle_id = handle.id()
-            except Exception:
-                # try internal attr if available
-                handle_id = getattr(handle, "_handle_id", None)
-
-            if handle_id is not None and hasattr(HEDS.SDK.libapi, "heds_datahandle_release"):
-                try:
-                    HEDS.SDK.libapi.heds_datahandle_release(handle_id)
-                    return
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # if nothing worked, just continue; Python GC + SDK often manages memory
-
-    def _upload_buffer_pool_as_handles(self):
-        """
-        Upload every preallocated buffer in self._mask_buffers to obtain data handles.
-        Populates/overwrites self._handle_pool. Thread-safe.
-        """
-        if not hasattr(self, "_handle_lock"):
-            self._init_handle_pool()
-
-        # Ensure pool has correct length
-        with self._handle_lock:
-            if not hasattr(self, "_handle_pool") or len(self._handle_pool) != len(self._mask_buffers):
-                self._handle_pool = [None] * len(self._mask_buffers)
-
-        for i, buf in enumerate(self._mask_buffers):
-            dh = None
-            try:
-                dh = self._safe_load_phase_data(buf)
-            except Exception as e:
-                print("Upload handle: exception while loading buffer:", e)
-                dh = None
-
-            with self._handle_lock:
-                prev = None
-                try:
-                    prev = self._handle_pool[i]
-                except Exception:
-                    prev = None
-                self._handle_pool[i] = dh
-
-            # release previous handle if replaced
-            if prev is not None and prev is not dh:
-                try:
-                    self._release_handle(prev)
-                except Exception:
-                    pass
-
-    def _show_handle_or_buffer(self, buf_idx: int, buf: np.ndarray = None, wait_for_frame: bool = True):
-        """
-        Show mask referenced by buf_idx using stored data-handle if available.
-        If handle-show fails, falls back to showing the buffer.
-        Returns (err_code, used_handle_flag).
-
-        Strategy:
-        - If we have an SLMDataHandle object in _handle_pool[buf_idx], ask the SDK to show it via
-            the helper HEDS.ShowDataHandles([dh]) (this builds the low-level id list properly).
-        - On any failure, fall back to self.slm.showPhaseData(buf).
-        """
-        err = HEDSERR_NoError
-        used_handle = False
-
-        # get handle (thread-safe)
-        handle = None
-        try:
-            with self._handle_lock:
-                if hasattr(self, "_handle_pool") and buf_idx < len(self._handle_pool):
-                    handle = self._handle_pool[buf_idx]
-        except Exception:
-            handle = None
-
-        # prefer handle-based show if we have a valid handle-like object
-        if handle is not None:
-            try:
-                # HEDS.ShowDataHandles expects a list of handles (SLMDataHandle or low-level id)
-                # this helper constructs the right id array and calls the low-level heds_datahandles_show
-                ret = HEDS.ShowDataHandles([handle])
-                if int(ret) == 0:  # HEDSERR_NoError
-                    used_handle = True
-                    err = int(ret)
-                else:
-                    # handle-show returned an error code; we'll fallback to buffer
-                    print("Warning: ShowDataHandles returned error:", HEDS.SDK.ErrorString(ret) if hasattr(HEDS.SDK, 'ErrorString') else ret)
-                    used_handle = False
-            except Exception as e:
-                # Some wrapper versions or handles may throw (e.g. unexpected internal representation).
-                # Fall back to showing buffer below.
-                # Print a concise warning for debugging.
-                print("Warning: ShowDataHandles(handle) raised exception, falling back to buffer:", e)
-                used_handle = False
-
-        # fallback: show the raw buffer data (most reliable)
-        if not used_handle:
-            if buf is None:
-                try:
-                    buf = self._mask_buffers[buf_idx]
-                except Exception:
-                    msg = "Error: no buffer available for buf_idx {}".format(buf_idx)
-                    print(msg)
-                    return (HEDSERR_GeneralError if 'HEDSERR_GeneralError' in globals() else -1, False)
-
-            try:
-                # Use background flag if available in wrapper; otherwise call normal show
-                if getattr(HEDS, 'HEDSSlmShowPhaseFlags', None) is not None:
-                    try:
-                        flags = HEDS.HEDSSlmShowPhaseFlags.SHOW_IN_BACKGROUND
-                        err = self.slm.showPhaseData(buf, flags)
-                    except Exception:
-                        # fallback to basic call
-                        err = self.slm.showPhaseData(buf)
-                else:
-                    err = self.slm.showPhaseData(buf)
-
-                # If the SDK exposes a 'wait' function and we want to wait, call it:
-                if wait_for_frame:
-                    wait_fn = getattr(self.slm, 'waitForLastFrameDisplayed', None) or getattr(self.slm, 'wait_for_frame', None)
-                    if callable(wait_fn):
-                        try:
-                            wait_fn()
-                        except Exception:
-                            pass
-
-            except Exception as e:
-                print("Error showing buffer via showPhaseData:", e)
-                return (HEDSERR_GeneralError if 'HEDSERR_GeneralError' in globals() else -1, False)
-
-        return (int(err) if err is not None else HEDSERR_NoError, used_handle)
-
-    def _clear_handle_pool(self):
-        """Release & clear all stored data-handles (best-effort)."""
-        if not hasattr(self, "_handle_pool"):
-            return
-        # Use the lock to avoid races with producer/consumer threads
-        with getattr(self, "_handle_lock", threading.Lock()):
-            for i, h in enumerate(self._handle_pool):
-                if h is not None:
-                    try:
-                        self._release_handle(h)
-                    except Exception:
-                        pass
-                    self._handle_pool[i] = None
-
-        # -------------------------------------------------------------------
-
-
+        print("Base annealer initialized.")
 
     # ---------------------------------------------------
     # 1. Hardware Connection & Control
@@ -534,105 +256,138 @@ class PhotonicAnnealer:
         """Initializes and connects to the HEDS SLM and Tiva Serial Port."""
         print("Connecting to hardware...")
 
-        # 1. Initialize SDK
-        err = HEDS.SDK.Init(4, 1)
-        if err != HEDSERR_NoError:
-            raise RuntimeError(f"Error initializing SDK: {HEDS.SDK.ErrorString(err)}")
+        # 1. Initialize SDK & SLM
+        if HEDS is not None:
+            try:
+                err = HEDS.SDK.Init(4, 1)
+                if err != HEDSERR_NoError:
+                    raise RuntimeError(f"Error initializing SDK: {HEDS.SDK.ErrorString(err)}")
 
-        # 2. Initialize SLM (this may open the GUI)
-        
-        self.slm = HEDS.SLM.Init()
-        if self.slm.errorCode() != HEDSERR_NoError:
-            raise RuntimeError(f"Error initializing SLM: {HEDS.SDK.ErrorString(self.slm.errorCode())}")
+                self.slm = HEDS.SLM.Init(openPreview=True)
+                if self.slm.errorCode() != HEDSERR_NoError:
+                    raise RuntimeError(f"Error initializing SLM: {HEDS.SDK.ErrorString(self.slm.errorCode())}")
 
-        self.slm_width = self.slm.width_px()
-        self.slm_height = self.slm.height_px()
-        print(f"SLM connected. Resolution: {self.slm_width} x {self.slm_height}")
+                self.slm_width = self.slm.width_px()
+                self.slm_height = self.slm.height_px()
+                print(f"SLM connected. Resolution: {self.slm_width} x {self.slm_height}")
+            except Exception as e:
+                print(f"Failed to initialize HEDS SLM: {e}")
+                print("Continuing in offline mode. SLM will not be used.")
+                self.slm = None
+        else:
+            print("HEDS SDK not available. Running in offline mode.")
+            # Use default resolution for layout calculations
+            self.slm_width = 1920
+            self.slm_height = 1080
 
-        # 3. Connect to Serial Port
+        # Update centers
+        self._center_x = self.slm_width / 2
+        self._center_y = self.slm_height / 2
+
+
+        # 2. Connect to Serial Port
         try:
-            # Use serial_timeout (0.0 => non-blocking) for fastest read behavior.
             self.ser = serial.Serial(port=self.serial_port, baudrate=self.serial_baud, timeout=self.serial_timeout)
-            # Wait for device to reset / settle
-            time.sleep(1.0)
-            # Clear any buffered input
+            time.sleep(1.0) # Wait for device to reset
             try:
                 self.ser.reset_input_buffer()
             except AttributeError:
-                # older pyserial
                 self.ser.flushInput()
             if self.ser.is_open:
-                print(f"Serial port {self.serial_port} opened at {self.serial_baud} baud (timeout={self.serial_timeout}).")
+                print(f"Serial port {self.serial_port} opened at {self.serial_baud} baud.")
             else:
-                raise RuntimeError(f"Serial port {self.serial_port} failed to open.")
+                raise RuntimeError("Serial port failed to open.")
+            self.start_pd_thread()
         except serial.SerialException as e:
-            raise RuntimeError(f"Failed to connect to serial port {self.serial_port} at {self.serial_baud} baud: {e}")
-        self.start_pd_thread()
+            print(f"Failed to connect to serial port {self.serial_port}: {e}")
+            print("Continuing in offline mode. Photodiode will not be read.")
+            self.ser = None
 
     def disconnect_hardware(self):
         """Safely disconnects from SLM and Serial port."""
-        # print("\nDisconnecting hardware...")
-        # if self.slm is not None:
-        #     self.slm.showBlankScreen(0) # Blank the SLM
-        #     err = self.slm.window().close()
-        #     if err == HEDSERR_NoError:
-        #         print("SLM window closed.")
-        #     HEDS.SDK.Exit()
-        #     print("HEDS SDK closed.")
-        
+        print("\nDisconnecting hardware...")
+        self.stop_pd_thread()
+
         if self.ser is not None and self.ser.is_open:
             self.ser.close()
             print(f"Serial port {self.serial_port} closed.")
-        self.stop_pd_thread()
+
         self._clear_handle_pool()
-
-
+        if self.slm is not None and HEDS is not None:
+            self.slm.showBlankScreen(0) # Blank the SLM
+            err = self.slm.window().close()
+            if err == HEDSERR_NoError:
+                print("SLM window closed.")
+            # HEDS.SDK.Exit()
+            print("HEDS SDK closed.")
+        # elif HEDS is not None:
+        #      # SDK might be init'd even if SLM failed
+        #     try:
+        #         HEDS.SDK.Exit()
+        #         print("HEDS SDK closed (cleanup).")
+        #     except Exception:
+        #         pass
 
     def _pd_reader_worker(self):
-        """Continuously read frames from serial and update self._last_photodiode_val."""
-        ser = getattr(self, "ser", None)
-        if ser is None or not ser.is_open:
+        """Continuously read frames from serial and update PD raw & averaged values."""
+        if self.ser is None or not self.ser.is_open:
+            print("PD Reader: Serial port not open. Exiting thread.")
             return
+
         buf = bytearray()
         FRAME_SIZE = 3
         START_BYTE = 0xA5
+
         while not self._pd_stop_event.is_set():
             try:
-                chunk = ser.read(512)  # non-blocking or very short timeout
-            except Exception:
-                time.sleep(0.0005)
+                chunk = self.ser.read(512)
+            except Exception as e:
+                print(f"PD Reader: Serial read error: {e}")
+                time.sleep(0.1)
                 continue
+
             if not chunk:
-                # yield CPU briefly
                 time.sleep(0.0002)
                 continue
+
             buf.extend(chunk)
             i = 0
-            updated = False
+
             while i + FRAME_SIZE <= len(buf):
                 if buf[i] != START_BYTE:
                     i += 1
                     continue
+
                 lo = buf[i+1]
                 hi = buf[i+2]
                 val = lo | (hi << 8)
-                # convert to voltage if desired here (cheap math)
+
+                # Convert to voltage
+                voltage = (val / 4095.0) * 3.3
+
+                # Update buffer & moving average
+                self._pd_buffer.append(voltage)
+                avg_voltage = sum(self._pd_buffer) / len(self._pd_buffer)
+
                 with self._pd_lock:
-                    self._last_photodiode_val = (val / ((1 << 12) - 1)) * 3.3  # change adc params if needed
-                updated = True
+                    self._last_pd_raw = voltage
+                    self._last_pd_avg = avg_voltage
+
                 i += FRAME_SIZE
+
             if i > 0:
                 del buf[:i]
-            if not updated:
-                # allow small sleep to avoid busy spin
-                time.sleep(0.002)
 
     def start_pd_thread(self):
+        if self.ser is None:
+            print("Cannot start PD thread: Serial port not connected.")
+            return
         if self._pd_thread is not None and self._pd_thread.is_alive():
             return
         self._pd_stop_event.clear()
         self._pd_thread = threading.Thread(target=self._pd_reader_worker, daemon=True)
         self._pd_thread.start()
+        print("Photodiode reader thread started.")
 
     def stop_pd_thread(self):
         if self._pd_thread is None:
@@ -640,420 +395,478 @@ class PhotonicAnnealer:
         self._pd_stop_event.set()
         self._pd_thread.join(timeout=1.0)
         self._pd_thread = None
+        print("Photodiode reader thread stopped.")
 
-    def _display_phase_mask(self, phase_mask_2d: np.ndarray) -> bool:
-        """(Internal) Displays a 2D NumPy array on the SLM."""
-        if not isinstance(phase_mask_2d, np.ndarray):
-            print("Error: The provided phase mask must be a NumPy array.")
-            return False
-        
-        # Convert to float32 for the SDK
-        phase_mask_float32 = phase_mask_2d.astype(np.float32)
-        
-        error = self.slm.showPhaseData(phase_mask_float32)
+    # ---------------------------------------------------
+    # 2. Buffer, Handle, and Streaming Management
+    # ---------------------------------------------------
+    ## Timing
+    def reset_stats(self):
+        for k in self.stats:
+            self.stats[k] = 0.0
 
-        if error != HEDSERR_NoError:
-            print(f"Error displaying phase mask: {HEDS.SDK.ErrorString(error)}")
-            return False
-        return True
+    def print_stats(self):
+        c = max(1, self.stats['count_masks'])
+        print("\n--- PROFILING RESULTS (Average per Mask) ---")
+        print(f"1. Mask Generation (Numba):   {self.stats['mask_gen']/c*1000:.3f} ms")
+        print(f"2. Buffer Upload (SDK):       {self.stats['buffer_upload']/c*1000:.3f} ms")
+        print(f"   (Total 'Produce' Time):    {(self.stats['mask_gen']+self.stats['buffer_upload'])/c*1000:.3f} ms")
+        print(f"3. SLM Display Call:          {self.stats['slm_show']/c*1000:.3f} ms")
+        print(f"4. Measurement (Settle+Read): {self.stats['measurement']/c*1000:.3f} ms")
+        print(f"5. Dead Time (Consumer Wait): {self.stats['queue_wait']/c*1000:.3f} ms")
+        print(f"   Dead Time (Producer Wait): {self.stats['producer_wait']/c*1000:.3f} ms")
+        print("--------------------------------------------")
 
+    def _reset_buffer_queues(self):
+        """(Re)create and populate free/filled buffer queues safely."""
+        self._free_buf_queue = queue.Queue(maxsize=len(self._mask_buffers))
+        self._filled_buf_queue = queue.Queue(maxsize=len(self._mask_buffers) + 2)
+        for i in range(len(self._mask_buffers)):
+            self._free_buf_queue.put_nowait(i)
+        with self._handle_lock:
+            self._handle_pool = [None] * len(self._mask_buffers)
 
-    def open_serial(port: str, baud: int = 921600) -> serial.Serial:
-        # timeout=0 makes read non-blocking (returns immediately with whatever's available)
-        # You can use a tiny timeout like 0.01 to yield CPU if you prefer.
-        return serial.Serial(port=port, baudrate=baud, timeout=0)
-
-    def _photodiode_measurement(self, duration: float = 0.05,
-                                adc_ref: Optional[float] = 3.3,
-                                adc_bits: int = 12):
-        """
-        Reads binary frames [0xA5][lo][hi] from self.ser (non-blocking).
-        Returns averaged voltage (if adc_ref) or average raw counts.
-        """
-        ser = getattr(self, "ser", None)
-        if ser is None or not ser.is_open:
-            raise RuntimeError("Serial port not open. Call _connect_hardware() first.")
-
-        # Flush any stale data
-        try:
-            ser.reset_input_buffer()
-        except AttributeError:
-            ser.flushInput()
-
-        buf = bytearray()
-        start_time = time.perf_counter()
-        sample_sum = 0
-        sample_count = 0
-        FRAME_SIZE = 3
-        START_BYTE = 0xA5
-        read_chunk_size = 512  # enough for 0.05 s @115200
-
-        while time.perf_counter() - start_time < duration:
-            chunk = ser.read(read_chunk_size)
-            if not chunk:
-                time.sleep(0.0005)
-                continue
-            buf.extend(chunk)
-            i = 0
-            while i + FRAME_SIZE <= len(buf):
-                if buf[i] != START_BYTE:
-                    i += 1
-                    continue
-                lo = buf[i + 1]
-                hi = buf[i + 2]
-                val = lo | (hi << 8)
-                sample_sum += val
-                sample_count += 1
-                i += FRAME_SIZE
-            if i > 0:
-                del buf[:i]
-
-        if sample_count == 0:
-            print("Warning: No photodiode data received.")
-            return getattr(self, "_last_photodiode_val", 0.0)
-
-        avg_count = sample_sum / sample_count
-        if adc_ref is not None:
-            val = (avg_count / ((1 << adc_bits) - 1)) * adc_ref
-        else:
-            val = avg_count
-        self._last_photodiode_val = val
-        return val
-    
     def _safe_load_phase_data(self, buf: np.ndarray):
-        """
-        Upload 'buf' to the SLM and return a data-handle, or None on failure.
-        Wraps SDK differences and common error cases.
-        """
+        """Upload 'buf' to the SLM and return a data-handle, or None on failure."""
+        if self.slm is None:
+            return None
         try:
             maybe = self.slm.loadPhaseData(buf)
         except Exception as e:
-            # SDK sometimes raises; log and return None
             print("Producer: loadPhaseData exception:", e)
             return None
 
-        # wrapper may return (err, handle) or handle directly
         dh = None
-        if isinstance(maybe, (tuple, list)):
-            # common wrapper pattern: (err, handle) or (err,)
-            if len(maybe) >= 2:
-                err = maybe[0]
-                cand = maybe[1]
-                if err == HEDSERR_NoError:
-                    dh = cand
-                else:
-                    # print readable error string if possible
-                    try:
+        try:
+            if isinstance(maybe, (tuple, list)):
+                if len(maybe) >= 2:
+                    err, cand = maybe[0], maybe[1]
+                    if err == HEDSERR_NoError:
+                        dh = cand
+                    else:
                         print("Producer: loadPhaseData err:", HEDS.SDK.ErrorString(err))
-                    except Exception:
-                        print("Producer: loadPhaseData returned error code", err)
-                    dh = None
-            elif len(maybe) == 1:
-                dh = maybe[0]
+                elif len(maybe) == 1:
+                    dh = maybe[0]
             else:
-                dh = None
-        else:
-            # returned the handle directly
-            dh = maybe
+                dh = maybe
+        except Exception:
+            dh = None # Ignore parsing errors
 
-        # sometimes the handle isn't the expected type; check lightly
-        if dh is None:
-            return None
         return dh
 
     def _release_handle(self, handle):
-        """
-        Try to release an SLM data-handle if SDK exposes a free/release function.
-        It's safe to call even if SDK doesn't support it.
-        """
-        try:
-            # try likely API names (depending on HEDS version)
-            if hasattr(self.slm, "releasePhaseDataHandle"):
-                self.slm.releasePhaseDataHandle(handle)
-            elif hasattr(self.slm, "freeDataHandle"):
-                self.slm.freeDataHandle(handle)
-            elif hasattr(HEDS.SDK, "FreeDataHandle"):
-                # sometimes in SDK root
-                HEDS.SDK.FreeDataHandle(handle)
-            else:
-                # no-op; SDK might manage handles automatically
-                pass
-        except Exception:
-            # ignore errors when releasing (we prefer continuing)
-            pass
+        """Try to release an SLM data-handle (best-effort)."""
+        if handle is None or self.slm is None:
+            return
+        # try:
+        #     # Check for various SDK wrapper versions
+        #     rel_fn = getattr(handle, "release", None) or \
+        #              getattr(handle, "free", None) or \
+        #              getattr(self.slm, "releasePhaseDataHandle", None) or \
+        #              getattr(self.slm, "freeDataHandle", None)
+
+        #     if callable(rel_fn):
+        #         rel_fn(handle)
+        # except Exception:
+        #     pass # Ignore errors during release
+        
+        handle.release() # Try standard method
 
     def _upload_buffer_pool_as_handles(self):
-        """
-        Upload every preallocated buffer in self._mask_buffers to obtain data handles.
-        This populates/overwrites self._handle_pool (same length as buffer pool).
-        Safe to call whenever buffers are (re)created.
-        """
-        # ensure container + lock exist
-        if not hasattr(self, "_handle_lock"):
-            self._handle_lock = threading.Lock()
-        if not hasattr(self, "_handle_pool") or len(self._handle_pool) != len(self._mask_buffers):
-            self._handle_pool = [None] * len(self._mask_buffers)
-
+        """Upload all buffers to populate the handle pool."""
+        if self.slm is None:
+            return
         for i, buf in enumerate(self._mask_buffers):
             dh = self._safe_load_phase_data(buf)
             with self._handle_lock:
-                # if there was an old handle, release it
-                prev = None
-                try:
-                    prev = self._handle_pool[i]
-                except Exception:
-                    prev = None
+                prev = self._handle_pool[i]
                 self._handle_pool[i] = dh
             if prev is not None and prev is not dh:
-                try:
-                    self._release_handle(prev)
-                except Exception:
-                    pass
+                prev.release() # Release previous handle if it exists
 
-    def _show_handle_or_buffer(self, buf_idx: int, buf: np.ndarray = None, wait_for_frame: bool = True):
-        """
-        Show the mask referenced by buf_idx using a stored data-handle if available.
-        If no handle exists or show-by-handle fails, falls back to showing the buffer.
-        Returns (err_code, used_handle_flag).
-        - buf_idx: index into self._mask_buffers / self._handle_pool
-        - buf: optional direct buffer (if consumer already has it)
-        - wait_for_frame: if True, try to call available wait function after show
-        """
+    def _show_handle_or_buffer(self, buf_idx: int, buf: np.ndarray, wait_for_frame: bool = True):
+        """Show mask by handle, falling back to buffer."""
+        if self.slm is None:
+            return (HEDSERR_NoError, False) # Simulate success in offline mode
+
         err = HEDSERR_NoError
         used_handle = False
-        # choose best show method
         handle = None
-        try:
-            with self._handle_lock:
-                if hasattr(self, "_handle_pool") and buf_idx < len(self._handle_pool):
-                    handle = self._handle_pool[buf_idx]
-        except Exception:
-            handle = None
 
-        # If handle exists, try showing by handle
+        with self._handle_lock:
+            if buf_idx < len(self._handle_pool):
+                handle = self._handle_pool[buf_idx]
+
         if handle is not None:
             try:
-                err = self.slm.showPhaseData(handle)
+                # # HEDS.ShowDataHandles expects a list
+                # ret = HEDS.ShowDataHandles([handle])
+                ret = handle.show() # Newer SDK versions may have this method
+                err = int(ret)
                 if err == HEDSERR_NoError:
                     used_handle = True
                 else:
-                    # attempt fallback to buffer if handle-show returns error
-                    try:
-                        # handle-show failed; print human-friendly message
-                        print("Warning: showPhaseData(handle) failed:", HEDS.SDK.ErrorString(err))
-                    except Exception:
-                        print("Warning: showPhaseData(handle) failed with code", err)
-                    used_handle = False
-                # if handle-show succeeded, optionally wait for frame
-                if used_handle and wait_for_frame:
-                    wait_fn = getattr(self.slm, 'waitForLastFrameDisplayed', None) or getattr(self.slm, 'wait_for_frame', None)
-                    if callable(wait_fn):
-                        try:
-                            wait_fn()
-                        except Exception:
-                            pass
-                    # else SDK might be synchronous for handle-show
+                    print(f"Warning: ShowDataHandles returned error: {HEDS.SDK.ErrorString(err)}")
             except Exception as e:
-                # fallback to showing buffer on any exception
-                # print("Warning: showPhaseData(handle) raised exception, falling back to buffer:", e)
-                used_handle = False
+                print(f"Warning: ShowDataHandles(handle) raised exception: {e}")
 
-        # If no handle or handle failed, fall back to show buffer
         if not used_handle:
-            # ensure we have a buffer to show
-            if buf is None:
-                try:
-                    buf = self._mask_buffers[buf_idx]
-                except Exception:
-                    print("Error: no buffer available for buf_idx", buf_idx)
-                    return (HEDSERR_GeneralError if 'HEDSERR_GeneralError' in globals() else -1, False)
             try:
-                # Use background flag if available
-                if getattr(HEDS, 'HEDSSlmShowPhaseFlags', None) is not None:
-                    try:
-                        flags = HEDS.HEDSSlmShowPhaseFlags.SHOW_IN_BACKGROUND
-                        err = self.slm.showPhaseData(buf, flags)
-                    except Exception:
-                        # fallback to normal call
-                        err = self.slm.showPhaseData(buf)
-                else:
+                flags = HEDS.HEDSSlmShowPhaseFlags.SHOW_IN_BACKGROUND
+                err = self.slm.showPhaseData(buf, flags)
+            except Exception:
+                try: # Fallback to basic call
                     err = self.slm.showPhaseData(buf)
-                # optionally wait
-                if wait_for_frame:
-                    wait_fn = getattr(self.slm, 'waitForLastFrameDisplayed', None) or getattr(self.slm, 'wait_for_frame', None)
-                    if callable(wait_fn):
-                        try:
-                            wait_fn()
-                        except Exception:
-                            pass
-            except Exception as e:
-                print("Error showing buffer via showPhaseData:", e)
-                return (HEDSERR_GeneralError if 'HEDSERR_GeneralError' in globals() else -1, False)
+                except Exception as e:
+                    print(f"Error: showPhaseData(buffer) failed: {e}")
+                    return (getattr(HEDS, "HEDSERR_GeneralError", -1), False)
 
-        return (err, used_handle)
+        if wait_for_frame:
+            if self.sync_slm:
+                # Standard Mode: Wait for hardware V-Sync (Reliable, capped at 60Hz)
+                try:
+                    wait_fn = getattr(self.slm, 'waitForLastFrameDisplayed', None)
+                    if callable(wait_fn):
+                        wait_fn()
+                except Exception:
+                    pass 
+            else:
+                # Turbo Mode: Manual sleep (Fast)
+                # 8ms is safe for Liquid Crystal settling. 
+                # You can try reducing this to 0.006 or 0.005 to go even faster.
+                time.sleep(0.008) 
+        # ----------------------------------------------------------------
+
+        return (int(err), used_handle)
+
     def _clear_handle_pool(self):
-        """Release & clear all stored data-handles (best-effort)."""
-        if not hasattr(self, "_handle_pool"):
-            return
-        with getattr(self, "_handle_lock", threading.Lock()):
+        """Release & clear all stored data-handles."""
+        with self._handle_lock:
             for i, h in enumerate(self._handle_pool):
                 if h is not None:
-                    try:
-                        self._release_handle(h)
-                    except Exception:
-                        pass
+                    h.release() # Release previous handle if it exists
                     self._handle_pool[i] = None
 
-    def _producer_worker_handles(self, spin_vector: np.ndarray, batch_size: int = 8):
+    def _producer_worker_handles(self, spin_vector: np.ndarray):
         """
-        Producer that fills buffers, uploads them (to get handles), and places (buf_idx, ready_time)
-        into the filled queue. This version is robust to filled-queue back-pressure and
-        returns buffers to free pool if the filled queue is full.
+        Producer thread with INSTRUMENTATION.
         """
         try:
-            # precompute spin phases once
+            # OPTIMIZATION HINT: You create this array every single time. Move this out or cache it?
             spin_phases = np.where(spin_vector == 1, np.pi/2, 3*np.pi/2).astype(np.float32)
-            n = self.num_spins
-            for k in range(n):
+
+            for j_idx, k in enumerate(self._active_modes):
                 if self.stop_producer_event.is_set():
                     break
 
-                # Wait longer for free buffer (avoid immediate timeout)
+                # MEASURE: Producer Waiting for Buffer
+                t_wait_start = time.perf_counter()
                 try:
                     buf_idx = self._free_buf_queue.get(timeout=5.0)
                 except queue.Empty:
-                    print("Producer: timed out waiting for free buffer (get). Retrying or exiting.")
-                    # signal consumer & exit gracefully
                     break
+                self.stats['producer_wait'] += (time.perf_counter() - t_wait_start)
 
                 buf = self._mask_buffers[buf_idx]
-
-                # timing for diagnostics
-                t_fill_start = time.perf_counter()
+                
+                # MEASURE: Mask Generation
+                t_gen_start = time.perf_counter()
                 try:
-                    alpha_ik = self._alpha_matrix[:, k]
-                    fill_mask_blocks_numba(
-                        buf,
-                        self._base_checkerboard,
-                        alpha_ik,
-                        spin_phases,
-                        self._spin_y0,
-                        self._spin_x0,
-                        self._macro_pix_y,
-                        self._macro_pix_x
-                    )
+                    # Get the alpha column corresponding to this active mode
+                    alpha_ik = self._alpha_matrix[:, j_idx]
+                    
+                    # <--- NEW SELECTION LOGIC --->
+                    if self.use_uint8:
+                        fill_mask_uint8(
+                            buf,
+                            self._base_checkerboard,
+                            alpha_ik,
+                            spin_phases,
+                            self._spin_y0,
+                            self._spin_x0,
+                            self._macro_pix_y,
+                            self._macro_pix_x
+                        )
+                    else:
+                        # Original float32 filler
+                        fill_mask_blocks_numba(
+                            buf,
+                            self._base_checkerboard,
+                            alpha_ik,
+                            spin_phases,
+                            self._spin_y0,
+                            self._spin_x0,
+                            self._macro_pix_y,
+                            self._macro_pix_x
+                        )
+                    # <--- END SELECTION LOGIC --->
+                    
                 except Exception as e:
-                    print(f"Producer: fill failed at k={k}:", e)
-                    # return buffer to free pool and continue
-                    try:
-                        self._free_buf_queue.put_nowait(buf_idx)
-                    except Exception:
-                        pass
+                    print(f"Producer: fill failed at mode k={k} (idx {j_idx}): {e}")
+                    self._free_buf_queue.put_nowait(buf_idx)
                     continue
-                t_fill_end = time.perf_counter()
-
-                # Upload to SDK (safe wrapper)
-                t_upload_start = time.perf_counter()
+                self.stats['mask_gen'] += (time.perf_counter() - t_gen_start)
+                
+                # MEASURE: Buffer Upload
+                t_up_start = time.perf_counter()
                 dh = self._safe_load_phase_data(buf)
-                t_upload_end = time.perf_counter()
-
-                # store handle and free previous
                 with self._handle_lock:
-                    prev = None
-                    try:
-                        prev = self._handle_pool[buf_idx]
-                    except Exception:
-                        prev = None
+                    prev = self._handle_pool[buf_idx]
                     self._handle_pool[buf_idx] = dh
                 if prev is not None and prev is not dh:
-                    try:
-                        self._release_handle(prev)
-                    except Exception:
-                        pass
+                    prev.release() # Release previous handle if it exists
+                self.stats['buffer_upload'] += (time.perf_counter() - t_up_start)
 
-                t_ready = time.perf_counter()
+                self.stats['count_masks'] += 1
 
-                # Try to put into filled queue but handle the case when it's full
                 try:
-                    # be willing to wait a bit for consumer to free space
-                    self._filled_buf_queue.put((buf_idx, t_ready), timeout=3.0)
+                    self._filled_buf_queue.put((buf_idx, k), timeout=3.0)
                 except queue.Full:
-                    # consumer is slow or dead — return buffer index to free queue to avoid deadlock
-                    print("Producer: filled queue full, returning buffer to free pool to avoid deadlock.")
-                    try:
-                        self._free_buf_queue.put_nowait(buf_idx)
-                    except Exception:
-                        # if even this fails, drop buffer (lost), but don't crash producer
-                        print("Producer: failed to return buffer to free pool after filled-queue full.")
-                    # optionally break to avoid busy loop
-                    time.sleep(0.01)
+                    self._free_buf_queue.put_nowait(buf_idx)
                     continue
 
-                # small diagnostic print occasionally
-                if (k % max(1, self.num_spins // 10)) == 0:
-                    # print a short perf summary for this iteration
-                    print(f"Producer: k={k} fill={(t_fill_end - t_fill_start):.4f}s upload={(t_upload_end - t_upload_start):.4f}s")
         except Exception as e:
-            import traceback
-            print("Producer exception (handles):", e)
-            traceback.print_exc()
+            print("Producer exception:", e)
         finally:
-            # always try to signal consumer we are done
             try:
                 self._filled_buf_queue.put(None, timeout=1.0)
             except Exception:
                 pass
-    def _reset_buffer_queues(self):
-        """(Re)create and populate free/filled buffer queues safely."""
-        # recreate queues
-        self._free_buf_queue = queue.Queue(maxsize=len(self._mask_buffers))
-        self._filled_buf_queue = queue.Queue(maxsize=len(self._mask_buffers) + 2)
+    # ---------------------------------------------------
+    # 3. Core Measurement Mechanisms
+    # ---------------------------------------------------
 
-        # populate free queue with indices
-        for i in range(len(self._mask_buffers)):
+    def _evaluate_spin_vector_streaming(self, spin_vector: np.ndarray, settle_time: float = 0.001):
+        """
+        Consumer generator with INSTRUMENTATION.
+        """
+        self.stop_producer_event.clear()
+        
+        if self.producer_thread is not None and self.producer_thread.is_alive():
+             self.stop_producer_event.set()
+             self.producer_thread.join(timeout=0.1)
+
+        self.producer_thread = threading.Thread(
+            target=self._producer_worker_handles,
+            args=(spin_vector,),
+            daemon=True
+        )
+        self.producer_thread.start()
+
+        num_measured = 0
+        
+        try:
+            while num_measured < len(self._active_modes):
+                # MEASURE: Dead Time (Consumer waiting for Producer)
+                t_wait_start = time.perf_counter()
+                try:
+                    item = self._filled_buf_queue.get(timeout=5.0)
+                except queue.Empty:
+                    break 
+                self.stats['queue_wait'] += (time.perf_counter() - t_wait_start)
+
+                if item is None: break 
+                buf_idx, k = item
+                buf = self._mask_buffers[buf_idx]
+
+                # MEASURE: Show Mask
+                t_show_start = time.perf_counter()
+                err, used_handle = self._show_handle_or_buffer(buf_idx, buf, wait_for_frame=True)
+                self.stats['slm_show'] += (time.perf_counter() - t_show_start)
+
+                if err != HEDSERR_NoError:
+                    self._free_buf_queue.put(buf_idx)
+                    yield (k, float('inf'))
+                    continue
+                
+                # MEASURE: Measurement (Settle + Read)
+                t_meas_start = time.perf_counter()
+                time.sleep(settle_time)
+                with self._pd_lock:
+                    measured_val = self._last_photodiode_val if self.ser is not None else print("cant read pd")
+                self.stats['measurement'] += (time.perf_counter() - t_meas_start)
+
+                num_measured += 1
+                yield (k, measured_val)
+
+                try:
+                    self._free_buf_queue.put(buf_idx, timeout=1.0)
+                except Exception:
+                    pass
+
+        finally:
+            self.stop_producer_event.set()
+            if self.producer_thread is not None:
+                self.producer_thread.join(timeout=3.0)
+            while True:
+                try:
+                    leftover = self._filled_buf_queue.get_nowait()
+                    if leftover is None: break
+                    idx, _ = leftover
+                    self._free_buf_queue.put_nowait(idx)
+                except Exception:
+                    break
+    def _evaluate_spin_vector_single_mode(self, spin_vector: np.ndarray, mode_index: int = 0, settle_time: float = 0.001) -> float:
+        """
+        Evaluates a single spin vector for a single eigenmode (e.g., for NPP).
+        This is a blocking, non-streaming function.
+        """
+        try:
+            buf_idx = self._free_buf_queue.get(timeout=2.0)
+        except queue.Empty:
+            print("SingleEval: timed out waiting for free buffer.")
+            return float('inf')
+
+        buf = self._mask_buffers[buf_idx]
+        
+        # Build spin_phases
+        spin_phases = np.where(spin_vector == 1, np.pi/2, 3*np.pi/2).astype(np.float32)
+
+        try:
+            # Get the single alpha column for the specified mode
+            alpha_column = self._alpha_matrix[:, mode_index]
+        except Exception as e:
+            print(f"SingleEval: Failed to get alpha_matrix column {mode_index}: {e}")
+            self._free_buf_queue.put_nowait(buf_idx) # Return buffer
+            return float('inf')
+
+        # Fill mask
+        try:
+            fill_mask_blocks_numba(
+                buf, self._base_checkerboard,
+                alpha_column, spin_phases,
+                self._spin_y0, self._spin_x0,
+                self._macro_pix_y, self._macro_pix_x
+            )
+        except Exception as e:
+            print(f"SingleEval: fill_mask failed: {e}")
+            self._free_buf_queue.put_nowait(buf_idx)
+            return float('inf')
+
+        # Upload handle (best-effort)
+        dh = self._safe_load_phase_data(buf)
+        if dh is not None:
+            with self._handle_lock:
+                prev = self._handle_pool[buf_idx]
+                self._handle_pool[buf_idx] = dh
+            if prev is not None and prev is not dh:
+                prev.release() # Release previous handle if it exists
+
+        # Show and measure
+        measured_val = float('inf')
+        try:
+            err, used_handle = self._show_handle_or_buffer(buf_idx, buf, wait_for_frame=True)
+            if err != HEDSERR_NoError:
+                print(f"SingleEval: show failed: {HEDS.SDK.ErrorString(err)}")
+            else:
+                time.sleep(settle_time)
+                with self._pd_lock:
+                    measured_val = self._last_photodiode_val if self.ser is not None else (0.5 + 0.1 * np.random.randn()) # Mock data
+        except Exception as e:
+            print(f"SingleEval: exception during show/measure: {e}")
+        
+        # Return buffer to free pool
+        self._free_buf_queue.put_nowait(buf_idx)
+        return measured_val
+
+
+    def _evaluate_spin_vector_batch_single_mode(self, spin_vectors: List[np.ndarray], mode_index: int = 0, settle_time: float = 0.001):
+        """
+        Evaluates a batch of spin vectors, all for the same single eigenmode.
+        Returns (list[measured_values], list[theory_values=None])
+        """
+        n_in = len(spin_vectors)
+        measured_values = [float('inf')] * n_in
+        theory_values = [None] * n_in # Not relevant here
+        
+        try:
+            alpha_column = self._alpha_matrix[:, mode_index].astype(np.float32)
+        except Exception as e:
+            print(f"BatchEval: Failed to get alpha_matrix column {mode_index}: {e}")
+            return measured_values, theory_values
+        
+        produced_map = {} # Maps input index -> buf_idx
+        
+        # 1. Produce all masks
+        for i, svec in enumerate(spin_vectors):
             try:
-                self._free_buf_queue.put_nowait(i)
-            except queue.Full:
-                break
+                buf_idx = self._free_buf_queue.get(timeout=2.0)
+            except queue.Empty:
+                print(f"BatchEval: No free buffer for input index {i}")
+                break # Stop producing
 
-        # ensure handle pool exists and matches buffer length
-        with getattr(self, "_handle_lock", threading.Lock()):
-            if not hasattr(self, "_handle_pool") or len(self._handle_pool) != len(self._mask_buffers):
-                self._handle_pool = [None] * len(self._mask_buffers)
+            buf = self._mask_buffers[buf_idx]
+            spin_phases = np.where(svec == 1, np.pi/2, 3*np.pi/2).astype(np.float32)
+            
+            try:
+                fill_mask_blocks_numba(
+                    buf, self._base_checkerboard,
+                    alpha_column, spin_phases,
+                    self._spin_y0, self._spin_x0,
+                    self._macro_pix_y, self._macro_pix_x
+                )
+            except Exception as e:
+                print(f"BatchEval: fill failed at idx {i}: {e}")
+                self._free_buf_queue.put_nowait(buf_idx) # Return buffer
+                continue # Skip to next vector
 
+            # Upload handle (best-effort)
+            dh = self._safe_load_phase_data(buf)
+            if dh is not None:
+                with self._handle_lock:
+                    prev = self._handle_pool[buf_idx]
+                    self._handle_pool[buf_idx] = dh
+                if prev is not None and prev is not dh:
+                    prev.release() # Release previous handle if it exists
 
+            produced_map[i] = buf_idx
+
+        # 2. Consume all produced masks
+        for i, buf_idx in produced_map.items():
+            buf = self._mask_buffers[buf_idx]
+            try:
+                err, used_handle = self._show_handle_or_buffer(buf_idx, buf, wait_for_frame=True)
+                if err != HEDSERR_NoError:
+                    print(f"BatchEval: show failed for input idx {i}")
+                else:
+                    time.sleep(settle_time)
+                    with self._pd_lock:
+                        measured_values[i] = self._last_photodiode_val if self.ser is not None else (0.5 + 0.1 * np.random.randn()) # Mock
+            except Exception as e:
+                print(f"BatchEval: show/measure exception for idx {i}: {e}")
+            
+            # Always return buffer
+            self._free_buf_queue.put_nowait(buf_idx)
+
+        return measured_values, theory_values
 
     # ---------------------------------------------------
-    # 2. Mask Generation & Preparation (Merged Logic)
+    # 4. Preparation & Abstract Methods
     # ---------------------------------------------------
-    def _precompute_alpha_matrix(self):
-        """Precompute alpha_ik for every eigenvector k (shape n_spins x n_spins, float32)."""
-        n = self.num_spins
-        # store columns as float32 for direct use in Numba
-        self._alpha_matrix = np.empty((n, n), dtype=np.float32)  # [spin_i, k]
-        # vectorized per-eigvector; keep memory manageable for typical n
-        for k in range(n):
-            target_amplitudes = self._compensation_factors * self.eigvecs[:, k]
-            max_abs_val = np.max(np.abs(target_amplitudes))
-            if max_abs_val < 1e-9:
-                max_abs_val = 1.0
-            normalized = np.clip(target_amplitudes / max_abs_val, -1.0, 1.0)
-            self._alpha_matrix[:, k] = np.arccos(normalized).astype(np.float32)
-        print(f"[perf] Precomputed alpha matrix ({n}x{n})")
 
-    
     def prep(self):
-        """Runs all necessary setup calculations in the correct order."""
-        print("Preparing model (layout, compensation, eigendecomposition)...")
+        """
+        Runs all necessary setup calculations in the correct order.
+        Called by child class __init__ AFTER num_spins is set.
+        """
+        if self.num_spins == 0:
+            raise RuntimeError("prep() called before num_spins was set by child class.")
+        
+        print(f"Preparing model for {self.num_spins} spins...")
         self._setup_layout()
         print(f"  - SLM Layout: {self._grid_rows} rows x {self._grid_cols} cols")
         print(f"  - Macropixel Size: {self._macro_pix_x} x {self._macro_pix_y} pixels")
         self._precompute_checkerboard()
         self._compute_compensation_factors()
+        
+        # Call abstract method to be implemented by child
         self._perform_eigendecomposition()
+        print(f"  - Identified {len(self._active_modes)} active eigenmodes.")
+        
         self._precompute_alpha_matrix()
+        print(f"  - Precomputed alpha matrix ({self._alpha_matrix.shape}).")
         print("Preparation complete.")
-    
+
     def _setup_layout(self):
         """Determines an optimal rectangular macropixel layout."""
         best_layout = (0, 0)
@@ -1062,20 +875,23 @@ class PhotonicAnnealer:
             cols = math.ceil(self.num_spins / rows)
             if cols > self.slm_width or rows > self.slm_height:
                 continue
-            if cols * self.slm_height > rows * self.slm_width:
-                continue
+            
             pixel_width = self.slm_width // cols
             pixel_height = self.slm_height // rows
             if pixel_width == 0 or pixel_height == 0:
                 continue
+            
+            # Favor squarer macropixels
+            aspect_ratio_diff = abs((pixel_width / pixel_height) - (self.slm_width / self.slm_height))
             area = pixel_width * pixel_height
+
             if area > max_area:
                 max_area = area
                 best_layout = (rows, cols)
 
         self._grid_rows, self._grid_cols = best_layout
         if self._grid_rows * self._grid_cols < self.num_spins or max_area == 0:
-             raise RuntimeError(f"Failed to find a grid for {self.num_spins} spins.")
+             raise RuntimeError(f"Failed to find a valid grid for {self.num_spins} spins on a {self.slm_width}x{self.slm_height} SLM.")
 
         self._macro_pix_x = self.slm_width // self._grid_cols
         self._macro_pix_y = self.slm_height // self._grid_rows
@@ -1084,6 +900,12 @@ class PhotonicAnnealer:
         grid_offset_x = (self.slm_width - total_width) // 2
         grid_offset_y = (self.slm_height - total_height) // 2
 
+        # Re-initialize coordinate arrays
+        self._spin_coords_x = np.zeros(self.num_spins)
+        self._spin_coords_y = np.zeros(self.num_spins)
+        self._spin_y0 = np.empty(self.num_spins, dtype=np.int32)
+        self._spin_x0 = np.empty(self.num_spins, dtype=np.int32)
+
         for i in range(self.num_spins):
             row = i // self._grid_cols
             col = i % self._grid_cols
@@ -1091,22 +913,15 @@ class PhotonicAnnealer:
             y0 = grid_offset_y + row * self._macro_pix_y
             self._spin_coords_x[i] = x0 + self._macro_pix_x / 2
             self._spin_coords_y[i] = y0 + self._macro_pix_y / 2
-            self._spin_slices.append((slice(y0, y0 + self._macro_pix_y), slice(x0, x0 + self._macro_pix_x)))
-        self._spin_y0 = np.empty(self.num_spins, dtype=np.int32)
-        self._spin_x0 = np.empty(self.num_spins, dtype=np.int32)
-        for i, (ys, xs) in enumerate(self._spin_slices):
-            # slice.start should be int
-            self._spin_y0[i] = int(ys.start)
-            self._spin_x0[i] = int(xs.start)
+            self._spin_y0[i] = y0
+            self._spin_x0[i] = x0
 
     def _precompute_checkerboard(self):
         """Pre-computes the base checkerboard pattern once."""
         lx = np.arange(self._macro_pix_x, dtype=np.int32)
         ly = np.arange(self._macro_pix_y, dtype=np.int32)
         lx_grid, ly_grid = np.meshgrid(lx, ly)
-        # checkerboard values as float32
         self._base_checkerboard = ((-1)**(lx_grid + ly_grid)).astype(np.float32)
-
 
     def _compute_compensation_factors(self):
         """Computes compensation factors (1/sqrt(I)) vectorized."""
@@ -1117,287 +932,166 @@ class PhotonicAnnealer:
         intensities[intensities < 1e-9] = 1e-9
         self._compensation_factors = 1.0 / np.sqrt(intensities)
 
-    def _perform_eigendecomposition(self):
-        """Performs eigendecomposition on the J matrix."""
-        self.eigvals, self.eigvecs = np.linalg.eigh(self.J)
-
-    # ---------------------------------------------------
-    # 3. [NEW] Streaming (FIFO) Mask Generation
-    # ---------------------------------------------------
-
-    def _generate_masks_streaming(self, spin_vector: np.ndarray):
-        """Yields buffer indices (int) that contain completed masks."""
-        spin_phases = np.where(spin_vector == 1, np.pi / 2, 3 * np.pi / 2)
-
-        two_pi = 2 * np.pi
-        # Local references for speed
-        spin_slices = self._spin_slices
-        base_checkerboard = self._base_checkerboard
-        comp_factors = self._compensation_factors
-        eigvecs = self.eigvecs
+    def _precompute_alpha_matrix(self):
+        """Precompute alpha_ik but only for active modes."""
         n = self.num_spins
+        m = len(self._active_modes) # Number of active modes
+        self._alpha_matrix = np.empty((n, m), dtype=np.float32)
 
-        # Generator loop: compute mask k into a free buffer, then yield its index
-        for k in range(n):
-            if self.stop_producer_event.is_set():
-                return
+        for j_idx, k in enumerate(self._active_modes):
+            # k is the *actual* eigenvector index (0 to N-1)
+            # j_idx is the *column* index in our alpha matrix (0 to M-1)
+            target_amplitudes = self._compensation_factors * self.eigvecs[:, k]
+            max_abs_val = np.max(np.abs(target_amplitudes))
+            if max_abs_val < 1e-9:
+                max_abs_val = 1.0
+            normalized = np.clip(target_amplitudes / max_abs_val, -1.0, 1.0)
+            self._alpha_matrix[:, j_idx] = np.arccos(normalized).astype(np.float32)
+        
+        if not self.beamcomp:
+            self._alpha_matrix.fill(np.pi / 4) # No compensation
 
-            # 1) Acquire a free buffer index (will block if none available)
-            try:
-                buf_idx = self._free_buf_queue.get(timeout=1.0)
-            except queue.Empty:
-                # no free buffer — bail politely
-                print("Producer: timed out waiting for free buffer")
-                return
+    # --- Abstract methods to be implemented by children ---
 
-            buf = self._mask_buffers[buf_idx]
-            # Fill buffer in-place (no new allocation)
-            # Option A: zero the full buffer first (optional)
-            # buf.fill(0.0)
-
-            # Compute target amplitudes & alpha (vectorized)
-            # target_amplitudes = comp_factors * eigvecs[:, k]
-            # max_abs_val = np.max(np.abs(target_amplitudes))
-            # if max_abs_val < 1e-9:
-            #     max_abs_val = 1.0
-            # normalized_amplitudes = np.clip(target_amplitudes / max_abs_val, -1.0, 1.0)
-            # alpha_ik = np.arccos(normalized_amplitudes)
-            alpha_ik = self._alpha_matrix[:, k]
-            # Fill blocks
-# Numba-accelerated block fill (single call)
-# Ensure dtypes: buf float32, base_checkerboard float32, alpha_ik float32, spin_phases float32, spin_y0/x0 int32
-            fill_mask_blocks_numba(
-                buf,
-                base_checkerboard,
-                alpha_ik.astype(np.float32),
-                spin_phases.astype(np.float32),
-                self._spin_y0,
-                self._spin_x0,
-                self._macro_pix_y,
-                self._macro_pix_x
-            )
-
-
-            # Put the buffer index into the filled queue for consumer to display
-            yield buf_idx
-
-    def _producer_worker(self, spin_vector: np.ndarray):
-        try:
-            for buf_idx in self._generate_masks_streaming(spin_vector):
-                if self.stop_producer_event.is_set():
-                    break
-                # Put the ready buffer index into the filled queue
-                self._filled_buf_queue.put(buf_idx)
-        except Exception as e:
-            import traceback
-            print("Producer exception:", e)
-            traceback.print_exc()
-        finally:
-            # signal end
-            self._filled_buf_queue.put(None)
-
-
-    def evaluate_energy(self, spin_vector: np.ndarray) -> float:
-        """Consumer: display each buffer provided by producer, measure PD, return energy.
-
-        Robust to receiving either buf_idx or (buf_idx, ready_time) from producer.
-        Returns total_energy (float). On fatal display/measure failure returns inf.
+    @abstractmethod
+    def _perform_eigendecomposition(self):
         """
-        # Reset/prepare
-        self.stop_producer_event.clear()
+        Problem-specific: Calculate eigvals, eigvecs, and _active_modes.
+        This method must set:
+        - self.eigvals (1D array)
+        - self.eigvecs (2D array)
+        - self._active_modes (list of ints, e.g., [0, 1, 5, ...])
+        """
+        pass
 
-        # Start producer (daemon thread) if not already running
-        self.producer_thread = threading.Thread(
-            target=self._producer_worker,
-            args=(spin_vector,),
-            daemon=True
+    @abstractmethod
+    def evaluate_energy(self, spin_vector: Union[np.ndarray, List[np.ndarray]]):
+        """
+        Problem-specific: Evaluate the energy of one or more spin vectors.
+        - If spin_vector is a 1D array, return a single float energy.
+        - If spin_vector is a list of 1D arrays, return a list of float energies.
+        """
+        pass
+
+    @abstractmethod
+    def run_annealing(self, initial_temp, final_temp, cooling_rate, steps_per_temp, **kwargs):
+        """
+        Problem-specific: Run the simulated annealing loop.
+        """
+        pass
+
+
+# -----------------------------------------------------------------
+# 4. Child Class: MaxCutAnnealer
+# -----------------------------------------------------------------
+
+class MaxCutAnnealer(PhotonicAnnealer):
+    """
+    Photonic Annealer for the Max-Cut problem (or any general Ising model)
+    defined by a full interaction matrix J.
+    """
+    def __init__(
+        self,
+        J: np.ndarray,
+        beam_sigma_x: float,
+        beam_sigma_y: float,
+        serial_port: str = 'COM21',
+        serial_baud: int = 115200,
+        use_uint8: bool = True,
+        factorizing: bool = False
+    ):
+        """
+        Initializes the annealer for a Max-Cut problem.
+
+        Args:
+            J (np.ndarray): The n_spins x n_spins interaction matrix.
+            ... (other args passed to base class)
+        """
+        print("Initializing MaxCut Annealer...")
+        # Call base __init__ to connect hardware
+        super().__init__(
+            beam_sigma_x=beam_sigma_x,
+            beam_sigma_y=beam_sigma_y,
+            serial_port=serial_port,
+            serial_baud=serial_baud,
+            use_uint8=use_uint8
         )
-        self.producer_thread.start()
 
+        if not isinstance(J, np.ndarray) or J.ndim != 2 or J.shape[0] != J.shape[1]:
+            raise ValueError("J must be a square 2D numpy array.")
+        if not np.allclose(J, J.T):
+            print("Warning: Interaction matrix J is not symmetric.")
+
+        max_coupling = np.max(np.abs(J))
+        self.J = J / max_coupling if max_coupling > 0 else J
+        self.num_spins = J.shape[0]
+        self.factorizing = factorizing
+        
+        # --- Run Full Preparation ---
+        # This calls _perform_eigendecomposition() implemented below
+        self.prep()
+
+    def _perform_eigendecomposition(self):
+        """
+        (Max-Cut) Decompose J and find all eigenmodes above a threshold.
+        """
+        print("  - (MaxCut) Performing full eigendecomposition...")
+        self.eigvals, self.eigvecs = np.linalg.eigh(self.J)
+        magnitudes = np.abs(self.eigvals)
+        max_mag = np.max(magnitudes) if magnitudes.size else 0.0
+
+        # Keep all modes above a small threshold
+        threshold = 0.01 * max_mag
+        self._active_modes = [k for k in range(self.num_spins) if True] #magnitudes[k] >= threshold] condition of if statement removed to use all modes
+        
+        # Ensure we have at least one mode if possible
+        if not self._active_modes and self.num_spins > 0:
+             self._active_modes = [int(np.argmax(magnitudes))]
+
+    def evaluate_energy(self, spin_vector: Union[np.ndarray, List[np.ndarray]]) -> float:
+        """
+        (Max-Cut) Evaluate energy by streaming all active modes and summing
+        their weighted measurements.
+        
+        Note: This implementation does not support batching.
+        """
+        if isinstance(spin_vector, list):
+            raise NotImplementedError("Batch evaluation is not implemented for MaxCutAnnealer. Use NumberPartitioningAnnealer for batching.")
+        
         total_energy = 0.0
-        measurement_duration = 1.0 / 60.0
-        filled_get_timeout = 2.0
-        free_put_timeout = 1.0
-
-        # Feature detection for SDK flags/wait functions
-        USE_BACKGROUND_FLAG = getattr(HEDS, 'HEDSSlmShowPhaseFlags', None) is not None
-        has_wait_fn = hasattr(self.slm, 'waitForLastFrameDisplayed') or hasattr(self.slm, 'wait_for_frame')
-
-        try:
-            for k in range(self.num_spins):
-                t_frame_start = time.perf_counter()
-                # Get next filled item (may be None sentinel)
-                try:
-                    item = self._filled_buf_queue.get(timeout=filled_get_timeout)
-                except queue.Empty:
-                    print("Error: timed out waiting for a filled buffer from producer.")
-                    total_energy = float('inf')
-                    break
-
-                if item is None:
-                    # producer signalled end
-                    print("Warning: Producer finished before all masks were measured.")
-                    break
-
-                # Accept either (buf_idx, t_ready) or buf_idx
-                if isinstance(item, tuple) or isinstance(item, list):
-                    if len(item) >= 2:
-                        buf_idx, t_ready = item[0], item[1]
-                    else:
-                        buf_idx = item[0]
-                        t_ready = None
-                else:
-                    buf_idx = item
-                    t_ready = None
-
-                # Validate buf_idx type
-                if not isinstance(buf_idx, int):
-                    print("Error: received non-int buffer index from filled queue:", repr(buf_idx))
-                    total_energy = float('inf')
-                    break
-
-                # Grab buffer reference (for fallback show)
-                try:
-                    buf = self._mask_buffers[buf_idx]
-                except Exception as e:
-                    print("Error: invalid buf_idx", buf_idx, "exception:", e)
-                    total_energy = float('inf')
-                    # try to continue (return index if possible) then break
-                    try:
-                        self._free_buf_queue.put(buf_idx, timeout=free_put_timeout)
-                    except Exception:
-                        pass
-                    break
-
-                # --- ⏱️ BEFORE SHOW ---
-                t_before_show = time.perf_counter()
-
-                # Use the safe show helper (tries handle -> buffer fallback)
-                err, used_handle = self._show_handle_or_buffer(buf_idx, buf=buf, wait_for_frame=True)
-
-                t_after_show = time.perf_counter()
-
-                if err != HEDSERR_NoError:
-                    try:
-                        print(f"Error displaying mask k={k}: {HEDS.SDK.ErrorString(err)}")
-                    except Exception:
-                        print("Error displaying mask k=", k, " err=", err)
-                    total_energy = float('inf')
-                    # return buffer index to free pool if possible
-                    try:
-                        self._free_buf_queue.put(buf_idx, timeout=free_put_timeout)
-                    except Exception:
-                        pass
-                    break
-
-                time.sleep(0.001)
-
-                # Measurement: use latest photodiode value sampled by PD thread
-                with self._pd_lock:
-                    measured_val = self._last_photodiode_val
-
-                if measured_val is None:
-                    print(f"Error measuring mask k={k}.")
-                    total_energy = float('inf')
-                    try:
-                        self._free_buf_queue.put(buf_idx, timeout=free_put_timeout)
-                    except Exception:
-                        pass
-                    break
-
-                t_after_pd = time.perf_counter()
-
-                # accumulate weighted energy
-                try:
-                    total_energy += float(measured_val) * float(self.eigvals[k])
-                except Exception:
-                    # in case eigvals indexing fails, continue but flag error
-                    total_energy = float('inf')
-                    try:
-                        self._free_buf_queue.put(buf_idx, timeout=free_put_timeout)
-                    except Exception:
-                        pass
-                    break
-
-                t_frame_end = time.perf_counter()
-
-                # === Record timing info (non-blocking logging) ===
-                frame_info = {
-                    "k": k,
-                    "mask_ready": (t_before_show - t_ready) if (t_ready is not None) else None,
-                    "show_time": t_after_show - t_before_show,
-                    "pd_time": t_after_pd - t_after_show,
-                    "frame_total": t_frame_end - t_frame_start,
-                    "timestamp": t_frame_start,
-                }
-                try:
-                    self._timing_log.append(frame_info)
-                    self._timing_window.append(frame_info)
-                except Exception:
-                    pass
-
-                # Periodic timing summary (safe)
-                try:
-                    if len(self._timing_log) % 100 == 0:
-                        totals = [f["frame_total"] for f in self._timing_window if f.get("frame_total") is not None]
-                        show_times = [f["show_time"] for f in self._timing_window if f.get("show_time") is not None]
-                        mask_ready_times = [f["mask_ready"] for f in self._timing_window if f.get("mask_ready") is not None]
-                        if totals and len(totals) > 1:
-                            import statistics
-                            print(f"[Timing] frames={len(totals)} avg={statistics.mean(totals)*1000:.2f} ms  "
-                                f"std={statistics.stdev(totals)*1000:.2f} ms  "
-                                f"show_avg={statistics.mean(show_times)*1000:.2f} ms  show_std={statistics.stdev(show_times)*1000:.2f} ms "
-                                + (f"mask_ready_avg={statistics.mean(mask_ready_times)*1000:.2f} ms" if mask_ready_times else ""))
-                except Exception:
-                    pass
-
-                # Return buffer index to free pool now that display+measure completed
-                try:
-                    self._free_buf_queue.put(buf_idx, timeout=free_put_timeout)
-                except Exception:
-                    # if we can't return it, keep going (producer will eventually timeout)
-                    pass
-
-        finally:
-            # Signal producer to stop (if still running) and join briefly
-            self.stop_producer_event.set()
-            if self.producer_thread is not None:
-                self.producer_thread.join(timeout=3.0)
-
-            # Drain any leftover filled queue items and return their indices to free queue
-            while True:
-                try:
-                    leftover = self._filled_buf_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if leftover is None:
-                    break
-                try:
-                    if isinstance(leftover, (tuple, list)) and len(leftover) >= 1:
-                        idx = leftover[0]
-                    else:
-                        idx = leftover
-                    if isinstance(idx, int):
-                        try:
-                            self._free_buf_queue.put_nowait(idx)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
+        modes_measured = 0
+        
+        # Use the streaming consumer from the base class
+        # It yields (k, measured_val) for each k in self._active_modes
+        for k, measured_val in self._evaluate_spin_vector_streaming(spin_vector, settle_time=0):
+            if np.isinf(measured_val):
+                print(f"Warning: Measurement failed for mode k={k}")
+                total_energy = float('inf') # Propagate error
+                break
+                
+            try:
+                # k is the *actual* eigenvector index
+                total_energy += measured_val * self.eigvals[k]
+                modes_measured += 1
+            except IndexError:
+                print(f"Error: Mode index {k} out of bounds for eigenvalues.")
+                total_energy = float('inf')
+                break
+        
+        if modes_measured != len(self._active_modes) and not np.isinf(total_energy):
+            print(f"Warning: Measured {modes_measured}/{len(self._active_modes)} modes.")
+            # Optionally return inf if not all modes were measured
+            # total_energy = float('inf')
+        print(f"  - Total measured energy: {total_energy:.4f}")
         return total_energy
 
-    # ---------------------------------------------------
-    # 4. Simulated Annealing Loop
-    # ---------------------------------------------------
-
-    def run_annealing(self, initial_temp, final_temp, cooling_rate, steps_per_temp):
+    def run_annealing(self, initial_temp, final_temp, cooling_rate, steps_per_temp, **kwargs):
         """
-        Performs the simulated annealing algorithm.
+        (Max-Cut) Performs the standard simulated annealing algorithm.
         """
         current_spin_vector = np.random.choice([-1, 1], size=self.num_spins)
         
-        print("Evaluating initial random spin configuration...")
+        print("Evaluating initial random spin configuration (Max-Cut)...")
         start_time_initial = time.time()
         current_energy = self.evaluate_energy(current_spin_vector)
         end_time_initial = time.time()
@@ -1418,24 +1112,30 @@ class PhotonicAnnealer:
                 
                 proposed_spin_vector = np.copy(current_spin_vector)
                 proposed_spin_vector[idx] *= -1
+                if self.factorizing:
+                    proposed_spin_vector[-1] = 1
 
+                eval_start = time.time()
                 proposed_energy = self.evaluate_energy(proposed_spin_vector)
-
-
+                eval_time = time.time() - eval_start
                 
+                if np.isinf(proposed_energy):
+                    print(f"  Step {step+1}/{steps_per_temp} | Eval failed. Skipping.")
+                    continue
+
                 delta_energy = proposed_energy - current_energy
 
-                if proposed_energy - min_energy < 0:
+                if proposed_energy < min_energy:
                     min_energy = proposed_energy
-                    min_spin_vector = proposed_spin_vector
-                acceptance_prob = math.exp(-delta_energy / temp) if temp > 0 else 0
-                is_accepted = delta_energy < 0 or random.random() < acceptance_prob
-                # print(f"Step {step}: Delta E: {delta_energy:.4f} | Prob: {acceptance_prob:.4f} | Accepted: {is_accepted}")
+                    min_spin_vector = np.copy(current_spin_vector)
+                
+                acceptance_prob = math.exp(-delta_energy / temp) if temp > 0 else 0.0
+                is_accepted = (delta_energy < 0) or (random.random() < acceptance_prob)
 
                 if is_accepted:
                     current_spin_vector = proposed_spin_vector
                     current_energy = proposed_energy
-                    print(f"  Step {step+1}/{steps_per_temp} | New Energy Accepted: {current_energy:.4f}")
+                    print(f"  Step {step+1}/{steps_per_temp} | New Energy Accepted: {current_energy:.4f} (eval: {eval_time:.2f}s)")
                 
                 energy_plot.append(current_energy)
 
@@ -1443,36 +1143,596 @@ class PhotonicAnnealer:
             print(f"  Temp step took {end_temp_time - start_temp_time:.2f}s")
             temp *= cooling_rate
             
-        print("\nSimulated annealing finished.")
+        print("\nSimulated annealing (Max-Cut) finished.")
         total_time = time.time() - annealing_start_time
         print(f"Total time taken: {total_time:.2f} seconds")
+        print(f"Minimum energy found: {min_energy:.4f}")
 
-        # Find the minimum energy and corresponding spin configuration
-        energy_1 = self.evaluate_energy(min_spin_vector)
-        energy_2 = self.evaluate_energy(current_spin_vector)
-        if energy_1 < energy_2:
-            print(f"Minimum energy found, final spin not optimum: {energy_1:.4f}")
-            current_spin_vector = min_spin_vector
-            current_energy = energy_1
-        
         # Plot the results
         plt.figure(figsize=(10, 6))
         plt.plot(energy_plot)
         plt.xlabel("Annealing Step")
         plt.ylabel("Measured Energy")
-        plt.title("Photonic Annealing Energy Convergence")
-        plt.show()
+        plt.title("Photonic Annealing (Max-Cut) Energy Convergence")
+        plt.show(block=False)
 
-        return current_spin_vector, energy_plot
+        return min_spin_vector, min_energy, energy_plot
 
 # -----------------------------------------------------------------
-# 3. Main Execution
+# 5. Child Class: NumberPartitioningAnnealer
 # -----------------------------------------------------------------
 
-if __name__ == '__main__':
+class NumberPartitioningAnnealer(PhotonicAnnealer):
+    """
+    Photonic Annealer for the Number Partitioning Problem (NPP).
+    This is a rank-1 problem, allowing for much faster single-mode
+    and batched evaluation.
+    """
+    def __init__(
+        self,
+        npp_weights: np.ndarray,
+        beam_sigma_x: float,
+        beam_sigma_y: float,
+        serial_port: str = 'COM21',
+        serial_baud: int = 115200
+    ):
+        """
+        Initializes the annealer for an NPP problem.
+
+        Args:
+            npp_weights (np.ndarray): 1D array of weights to be partitioned.
+            ... (other args passed to base class)
+        """
+        print("Initializing Number Partitioning Annealer...")
+        # Call base __init__ to connect hardware
+        super().__init__(
+            beam_sigma_x=beam_sigma_x,
+            beam_sigma_y=beam_sigma_y,
+            serial_port=serial_port,
+            serial_baud=serial_baud
+        )
+
+        w = np.asarray(npp_weights, dtype=np.float64).flatten()
+        self.npp_weights = w
+        self.num_spins = w.shape[0]
+        
+        # Construct the rank-1 J matrix
+        self.J = np.outer(w, w)
+        
+        # --- Run Full Preparation ---
+        self.prep()
+
+    def _perform_eigendecomposition(self):
+        """
+        (NPP) Decompose J and find the *single* dominant eigenmode.
+        """
+        print("  - (NPP) Performing rank-1 eigendecomposition...")
+        self.eigvals, self.eigvecs = np.linalg.eigh(self.J)
+        magnitudes = np.abs(self.eigvals)
+
+        # For rank-1, we only care about the single largest magnitude mode
+        k_star = int(np.argmax(magnitudes))
+        self._active_modes = [k_star]
+        
+        # Store the dominant eigenvalue (for theoretical energy)
+        self.dominant_eigval = self.eigvals[k_star]
+
+    def evaluate_energy(self, spin_vector: Union[np.ndarray, List[np.ndarray]]):
+        """
+        (NPP) Evaluate "energy" (raw photodiode value) for one or more vectors.
+        This is a dispatcher for single-mode evaluation.
+        The "energy" is just the photodiode reading, which is proportional
+        to (w . s)^2.
+        """
+        # The alpha matrix for NPP only has one column (j_idx=0),
+        # which corresponds to the dominant eigenmode (k_star).
+        MODE_INDEX = 0 
+        
+        if isinstance(spin_vector, list):
+            # Batch evaluation
+            measured_vals, _ = self._evaluate_spin_vector_batch_single_mode(
+                spin_vector, mode_index=MODE_INDEX
+            )
+            return measured_vals
+        else:
+            # Single vector evaluation
+            measured_val = self._evaluate_spin_vector_single_mode(
+                spin_vector, mode_index=MODE_INDEX
+            )
+            return measured_val
+
+    def run_annealing(
+        self,
+        initial_temp: float,
+        final_temp: float,
+        cooling_rate: float,
+        steps_per_temp: int,
+        batch_size: int = 8,
+        verbose: bool = True,
+        **kwargs
+    ):
+        """
+        (NPP) Batched (approximate) Simulated Annealing.
+        Measures `batch_size` candidates in parallel and selects one.
+        """
+        print(f"Running Batched NPP Annealing (batch_size={batch_size})...")
+        batch_size = max(1, int(batch_size))
+        steps_per_temp = max(1, int(steps_per_temp))
+
+        # initialize state
+        current_spin_vector = np.random.choice([-1, 1], size=self.num_spins)
+        
+        t0 = time.time()
+        current_energy = self.evaluate_energy(current_spin_vector)
+        if verbose:
+            print(f"Initial measured energy: {current_energy:.6f} (eval time: {time.time()-t0:.2f}s)")
+
+        energy_trace = [current_energy]
+        temp = float(initial_temp)
+        anneal_start = time.time()
+        min_energy = current_energy
+        min_spin_vector = np.copy(current_spin_vector)
+
+        EPS = 1e-12
+        MAX_EXP_ARG = 700 # avoid overflow in exp
+
+        while temp > final_temp:
+            if verbose:
+                print(f"\nTemperature: {temp:.6f}")
+            start_temp_t = time.time()
+
+            for step in range(steps_per_temp):
+                # 1) Build batch of candidate spin vectors
+                # ... inside the step loop ...
+
+                # 1) Build batch of candidates (SAME AS YOUR CODE)
+                candidates = []
+                candidate_indices = []
+                for _ in range(batch_size):
+                    idx = random.randint(0, self.num_spins - 1)
+                    candidate = np.copy(current_spin_vector)
+                    candidate[idx] *= -1
+                    candidates.append(candidate)
+                    candidate_indices.append(idx)
+
+                # 2) Evaluate batch (SAME AS YOUR CODE)
+                measured_energies = self.evaluate_energy(candidates) 
+
+                # 3) Compute selection weights
+                weights = []
+                valid_candidates = []
+
+                # --- FIX START: Add probability of staying put ---
+                # We add the current state as a valid option.
+                # Delta E is 0, so Weight is exp(0) = 1.0
+                weights.append(1.0) 
+                valid_candidates.append({
+                    'index_in_batch': -1, # Marker for "Current State"
+                    'delta_E': 0.0,
+                    'prob': 1.0,
+                    'E_prop': current_energy
+                })
+                # --- FIX END ---
+
+                for i, E_prop in enumerate(measured_energies):
+                    if not np.isfinite(E_prop):
+                        weights.append(0.0)
+                    else:
+                        delta = float(E_prop) - float(current_energy)
+                        # Note: If delta is negative (good move), arg is positive (weight > 1)
+                        # If delta is positive (bad move), arg is negative (weight < 1)
+                        arg = -delta / max(EPS, temp)
+                        
+                        if arg > MAX_EXP_ARG: arg = MAX_EXP_ARG
+                        
+                        try:
+                            w = math.exp(arg)
+                        except OverflowError:
+                            w = float('inf') if arg > 0 else 0.0
+                        
+                        weights.append(w)
+                        valid_candidates.append({
+                            'index_in_batch': i,
+                            'delta_E': delta,
+                            'prob': w,
+                            'E_prop': E_prop
+                        })
+                
+                # 4) Roulette Wheel Selection
+                total_w = float(sum(weights))
+                
+                if total_w > 0.0:
+                    r = random.random() * total_w
+                    cum = 0.0
+                    picked_candidate = None
+
+                    # Iterate through valid_candidates to match logic
+                    # (Your previous loop iterated weights, but we need to map back to indices)
+                    for i, w in enumerate(weights):
+                        cum += w
+                        if r <= cum:
+                            # We found our winner
+                            # We need to find which candidate this corresponds to
+                            # Since we appended "Stay" (index -1) first, or last, handle carefuly.
+                            # Better to just use the valid_candidates list directly:
+                            picked_candidate = valid_candidates[i] 
+                            break
+                    
+                    # 5) Execute Move (if not staying)
+                    if picked_candidate['index_in_batch'] != -1:
+                        # We picked a neighbor, so we update
+                        batch_idx = picked_candidate['index_in_batch']
+                        current_spin_vector = candidates[batch_idx]
+                        current_energy = measured_energies[batch_idx]
+                        
+                        accepted_idx_in_spins = candidate_indices[batch_idx]
+                        
+                        if verbose and (step % max(1, steps_per_temp // 5) == 0):
+                             print(f"  Step {step+1}: Accepted energy {current_energy:.6f} (idx flipped: {accepted_idx_in_spins})")
+                    else:
+                        # We picked index -1, which means "Stay". 
+                        # Do nothing to current_spin_vector
+                        pass
+
+                    # Track global best
+                    if current_energy < min_energy:
+                        min_energy = current_energy
+                        min_spin_vector = np.copy(current_spin_vector)
+                energy_trace.append(current_energy)
+
+            end_temp_t = time.time()
+            if verbose:
+                print(f"  Temp iteration time: {end_temp_t - start_temp_t:.2f}s")
+            temp *= cooling_rate
+
+        total_elapsed = time.time() - anneal_start
+        print("\nBatched NPP annealing finished.")
+        print(f"Total elapsed time: {total_elapsed:.2f}s")
+        
+        # Final theoretical energy
+        final_dot = np.dot(min_spin_vector, self.npp_weights)
+        final_theory_energy = final_dot**2
+        print(f"Best measured energy found: {min_energy:.6f}")
+        print(f"Best spin vector sum (partition diff): {final_dot:.4f}")
+        print(f"Best theoretical energy (sum^2): {final_theory_energy:.4f}")
+
+        # plot trace
+        plt.figure(figsize=(10, 6))
+        plt.plot(energy_trace)
+        plt.xlabel("Annealing Step (Batched)")
+        plt.ylabel("Measured Energy (Raw Photodiode)")
+        plt.title("Photonic Annealing (NPP) Energy Trace")
+        plt.show(block=False)
+
+        return min_spin_vector, min_energy
+import time
+import numpy as np
+import math
+import random
+
+class RobustDynamicNPPAnnealer(NumberPartitioningAnnealer):
+    """
+    A robust implementation of the NPP Annealer that supports Dynamic Cluster Flipping.
+    
+    FIXES:
+    - Bypasses the Base Class Queue system (which causes deadlocks in sequential modes).
+    - Uses a dedicated, pre-allocated buffer for high-speed single-shot evaluation.
+    - Implements the 'Adaptive Polychromatic' cluster sizing logic.
+    """
+
+    def __init__(self, npp_weights: np.ndarray, beam_sigma_x: float, beam_sigma_y: float, 
+                 serial_port: str = 'COM21', serial_baud: int = 115200, use_uint8: bool = True):
+        
+        super().__init__(
+            npp_weights=npp_weights, 
+            beam_sigma_x=beam_sigma_x, 
+            beam_sigma_y=beam_sigma_y,
+            serial_port=serial_port, 
+            serial_baud=serial_baud
+        )
+        self.use_uint8 = use_uint8
+        
+        # --- DEDICATED RESOURCES FOR DIRECT DRIVE ---
+        # We bypass the queue system to prevent "timed out waiting for free buffer" errors
+        dtype = np.uint8 if self.use_uint8 else np.float32
+        self._direct_buffer = np.zeros((self.slm_height, self.slm_width), dtype=dtype)
+        self._direct_handle = None 
+        
+        # Pre-cache the phases for +1 and -1 spins for speed
+        self._phase_map = {
+            1: np.float32(np.pi/2),
+            -1: np.float32(3*np.pi/2)
+        }        
+        # --- Profiling Storage ---
+        # We store the last 1000 samples to keep memory low but get good averages
+        self.timings = {
+            'mask_creation': [], # Numba fill time
+            'slm_upload': [],    # USB transfer + Show command
+            'photodiode': [],    # Settle + Serial Read
+            'total_step': []     # Full Metropolis iteration
+        }
+        
+        # Dedicated buffer resources (same as before)
+        dtype = np.uint8 if self.use_uint8 else np.float32
+        self._direct_buffer = np.zeros((self.slm_height, self.slm_width), dtype=dtype)
+        self._direct_handle = None 
+
+    def evaluate_energy_direct(self, spin_vector: np.ndarray, settle_time: float = 0.002) -> float:
+        """
+        Evaluates energy and profiles the hardware interaction steps.
+        """
+        # --- TIMER START: Mask Creation ---
+        t0 = time.perf_counter()
+        
+        # 1. Hardware Sanity Check
+        if self.slm is None:
+            return 100.0 + np.random.randn()
+
+        # 2. Prepare Data
+        spin_phases = np.where(spin_vector == 1, np.pi/2, 3*np.pi/2).astype(np.float32)
+        alpha_col = self._alpha_matrix[:, 0]
+
+        # 3. Fill Buffer
+        if self.use_uint8:
+            fill_mask_uint8(
+                self._direct_buffer, self._base_checkerboard,
+                alpha_col, spin_phases,
+                self._spin_y0, self._spin_x0,
+                self._macro_pix_y, self._macro_pix_x
+            )
+        else:
+            fill_mask_blocks_numba(
+                self._direct_buffer, self._base_checkerboard,
+                alpha_col, spin_phases,
+                self._spin_y0, self._spin_x0,
+                self._macro_pix_y, self._macro_pix_x
+            )
+        
+        # --- TIMER SPLIT: Mask Creation Done ---
+        t1 = time.perf_counter()
+        self.timings['mask_creation'].append(t1 - t0)
+
+        # 4. Upload & Show
+        if self._direct_handle is not None:
+            self._direct_handle.release()
+            self._direct_handle = None
+            
+        self._direct_handle = self._safe_load_phase_data(self._direct_buffer)
+        
+        if self._direct_handle:
+            self._direct_handle.show() 
+            pass
+        else:
+            self.slm.showPhaseData(self._direct_buffer)
+            pass
+
+        # Wait for VSync/Settle
+        if self.sync_slm:
+            try:
+                self.slm.waitForLastFrameDisplayed()
+            except:
+                time.sleep(0.008)
+                print("Warning: SLM waitForLastFrameDisplayed() failed, using fixed sleep.")
+        else:
+            # time.sleep(0.006)
+            pass
+
+        # --- TIMER SPLIT: SLM Upload/Show Done ---
+        t2 = time.perf_counter()
+        self.timings['slm_upload'].append(t2 - t1)
+
+        # 5. Measure (Photodiode)
+        # time.sleep(settle_time)
+        
+        val = 0.0
+        with self._pd_lock:
+            if self.ser is None or not self.ser.is_open:
+                val = (np.dot(spin_vector, self.npp_weights)**2) * 0.0001
+                print("Warning: Serial port not open, returning theoretical value with noise.")
+            else:
+                print("entering photodiode measurement loop")
+                for i in range(100):
+                    energy = self._last_photodiode_val
+                    val += energy
+                    print(val)
+                    i+=1
+                    time.sleep(0.01)  # Small delay to avoid overwhelming the serial port
+
+        # --- TIMER SPLIT: Measurement Done ---
+        t3 = time.perf_counter()
+        self.timings['photodiode'].append(t3 - t2)
+                
+        return val/80
+
+    def run_annealing(self, 
+                      initial_temp: float, 
+                      final_temp: float, 
+                      cooling_rate: float, 
+                      steps_per_temp: int, 
+                      Nc0: int = None, 
+                      verbose: bool = True):
+        
+        # Reset timings
+        for k in self.timings: self.timings[k] = []
+
+        if Nc0 is None: Nc0 = max(1, int(self.num_spins * 0.15))
+        
+        current_spins = np.random.choice([-1, 1], size=self.num_spins)
+        current_energy = self.evaluate_energy_direct(current_spins)
+        
+        E0 = current_energy if current_energy > 1e-6 else 1.0 
+        best_spins = current_spins.copy()
+        best_energy = current_energy
+        temp = initial_temp
+        energy_trace = [current_energy]
+        
+        step_count = 0
+        total_steps = int(math.log(final_temp / initial_temp) / math.log(cooling_rate)) * steps_per_temp
+        
+        print(f"--- Starting Annealing ({total_steps} steps expected) ---")
+
+        t_run_start = time.perf_counter()
+
+        while temp > final_temp:
+            for _ in range(steps_per_temp):
+                # --- TIMER START: Full Step ---
+                t_step_start = time.perf_counter()
+                
+                step_count += 1
+                
+                # A. Dynamic Cluster Sizing
+                
+                ratio = current_energy / E0
+                # E0 = current_energy
+                if ratio < 0: ratio = 0
+                factor = math.pow(ratio, 1/15)
+                Nc = int(round(Nc0 * factor))
+                Nc = max(1, min(Nc, self.num_spins))
+                
+                # B. Propose
+                proposal = current_spins.copy()
+                flip_indices = random.sample(range(self.num_spins), Nc)
+                proposal[flip_indices] *= -1
+                
+                # C. Evaluate
+                new_energy = self.evaluate_energy_direct(proposal)
+                
+                # D. Accept/Reject
+                delta_E = new_energy - current_energy
+                if new_energy < current_energy:
+                    accepted = True
+                else:
+                    prob = math.exp(-delta_E / temp)
+                    accepted = random.random() < prob
+                    
+                if accepted:
+                    current_spins = proposal
+                    current_energy = new_energy
+                    print(f" Step {step_count}: Accepted new energy {current_energy:.6f} (Nc={Nc})")
+                    if current_energy < best_energy:
+                        best_energy = current_energy
+                        best_spins = current_spins.copy()
+
+                # --- TIMER END: Full Step ---
+                t_step_end = time.perf_counter()
+                self.timings['total_step'].append(t_step_end - t_step_start)
+
+            energy_trace.append(current_energy)
+            temp *= cooling_rate
+            
+            if verbose and step_count % (steps_per_temp * 5) == 0:
+                # Print Rolling Averages
+                avg_step = np.mean(self.timings['total_step'][-50:]) * 1000
+                avg_disp = np.mean(self.timings['slm_upload'][-50:]) * 1000
+                print(f"Step {step_count} | T={temp:.4f} | E={current_energy:.4f} | "
+                      f"StepTime: {avg_step:.1f}ms | DispTime: {avg_disp:.1f}ms | Nc = {Nc}" )
+
+        t_run_end = time.perf_counter()
+        total_run_time = t_run_end - t_run_start
+        print(f"\n--- Annealing Complete in {total_run_time:.2f}s ---")
+
+        return best_spins, best_energy, energy_trace
+    
+
+class ThreadedDynamicNPPAnnealer(RobustDynamicNPPAnnealer):
+    """
+    NPP Annealer that uses the SAME measurement technique as MaxCutAnnealer.
+    
+    1. Background Thread: RUNNING (continuously updates self._last_photodiode_val)
+    2. Measurement: Waits for settle_time, then grabs the variable.
+    3. Queues: Bypassed (Direct Buffer) for speed, but PD logic is threaded.
+    """
+
+    def __init__(self, *args, **kwargs):
+        # Initialize Base (RobustDynamicNPPAnnealer)
+        # This normally sets up the buffers and layout
+        super().__init__(*args, **kwargs)
+        
+        # Explicitly Ensure Thread is STARTED (Just like MaxCut)
+        self.start_pd_thread()
+        print(" [ThreadedAnnealer] Background PD thread is ACTIVE.")
+
+    def evaluate_energy_direct(self, spin_vector: np.ndarray, settle_time: float = 0.005) -> float:
+        """
+        Max-Cut Style Measurement:
+        1. Show Mask.
+        2. Sleep (Settle).
+        3. Read self._last_photodiode_val (updated by background thread).
+        """
+        # --- 1. MASK GENERATION ---
+        # (Same optimized Numba/Direct Buffer code as before)
+        spin_phases = np.where(spin_vector == 1, np.pi/2, 3*np.pi/2).astype(np.float32)
+        alpha_col = self._alpha_matrix[:, 0]
+
+        if self.use_uint8:
+            fill_mask_uint8(self._direct_buffer, self._base_checkerboard,
+                            alpha_col, spin_phases, self._spin_y0, self._spin_x0,
+                            self._macro_pix_y, self._macro_pix_x)
+        else:
+            fill_mask_blocks_numba(self._direct_buffer, self._base_checkerboard,
+                                   alpha_col, spin_phases, self._spin_y0, self._spin_x0,
+                                   self._macro_pix_y, self._macro_pix_x)
+        
+        # --- 2. DISPLAY ---
+        # Reuse handle for speed
+        if self._direct_handle:
+            self._direct_handle.release()
+            self._direct_handle = None
+        # self._direct_handle = self._safe_load_phase_data(self._direct_buffer)
+        
+        # if self._direct_handle:
+        #     self._direct_handle.show()
+        # else:
+        #     self.slm.showPhaseData(self._direct_buffer)
+
+        # # Hardware Sync (Wait for LC to physically change)
+        # if self.sync_slm:
+        #     try:
+        #         self.slm.waitForLastFrameDisplayed()
+        #     except:
+        #         time.sleep(0.01) # Turbo fallback
+        #         # print("Warning: SLM waitForLastFrameDisplayed() failed, using fixed sleep.")
+        # else:
+        #      # If sync is off, we MUST sleep enough for the SLM liquid crystals (approx 4-8ms)
+        #      # plus the time it takes for the thread to catch the next serial packet.
+        #      pass
+
+        # --- 3. MEASURE (The MaxCut Technique) ---
+        
+        # A. Wait for Photodiode to react AND Serial Thread to pick it up
+        # This is the most critical parameter. 
+        # It needs to be: SLM_Response_Time + Serial_Latency
+        time.sleep(settle_time)
+        
+        val = 0.0
+        
+        # B. Simply read the variable that the thread is updating
+        with self._pd_lock:
+            if self.ser is None or not self.ser.is_open:
+                 # Simulation fallback
+                 val = (np.dot(spin_vector, self.npp_weights)**2) * 0.0001
+                 print("Warning: Serial port not open, returning theoretical value with noise.")
+            else:
+                 print("Reading photodiode value from background thread...")
+                 for i in range(150):
+                     energy = self._last_photodiode_val
+                     val += energy
+                    #  print(val)
+                     i+=1
+                 print("Finished reading photodiode values.", val)
+
+        return val
+# -----------------------------------------------------------------
+# 6. Main Execution
+# -----------------------------------------------------------------
+
+def run_maxcut_benchmark():
+    print("\n" + "="*50)
+    print("RUNNING MAX-CUT BENCHMARK")
+    print("="*50)
     
     # --- 1. Define Problem ---
-    NUM_SPINS = 40
+    NUM_SPINS = 20 # Smaller for faster testing
     np.random.seed(42)
     J_random = np.random.randn(NUM_SPINS, NUM_SPINS)
     J_random = (J_random + J_random.T) / 2 # Symmetrize
@@ -1480,45 +1740,257 @@ if __name__ == '__main__':
     # --- 2. Define Experimental Parameters ---
     BEAM_SIGMA_X = 600
     BEAM_SIGMA_Y = 600
+    SERIAL_PORT = 'COM21' # [USER] Verify this port
     
     # --- 3. Define Annealing Parameters ---
     INITIAL_TEMP = 1000.0
     FINAL_TEMP = 0.1
-    COOLING_RATE = 0.95
-    STEPS_PER_TEMP = 5 # Set low for testing, increase for real runs
+    COOLING_RATE = 0.90
+    STEPS_PER_TEMP = 5 # Set low for testing
 
-    annealer = None # Initialize to None for the finally block
+    annealer = None
     try:
-        # --- 4. Initialize Annealer (connects hardware, runs prep) ---
-        annealer = PhotonicAnnealer(
+        annealer = MaxCutAnnealer(
             J=J_random,
             beam_sigma_x=BEAM_SIGMA_X,
             beam_sigma_y=BEAM_SIGMA_Y,
-            serial_port='COM21' # [USER] Verify this port
+            serial_port=SERIAL_PORT
         )
         
-        # --- 5. Run the Annealing ---
-        final_spins, energy_data = annealer.run_annealing(
+        final_spins, min_energy, energy_data = annealer.run_annealing(
             initial_temp=INITIAL_TEMP,
             final_temp=FINAL_TEMP,
             cooling_rate=COOLING_RATE,
             steps_per_temp=STEPS_PER_TEMP
         )
         
-        print("\n--- Results ---")
+        print("\n--- Max-Cut Results ---")
         print(f"Final Spin Configuration: {final_spins}")
-        print(f"Final Energy: {energy_data[-1]}")
+        print(f"Minimum Energy (weighted sum): {min_energy:.4f}")
 
     except Exception as e:
-        print(f"\nAn error occurred: {e}")
+        print(f"\nAn error occurred during Max-Cut benchmark: {e}")
         import traceback
         traceback.print_exc()
-
     finally:
-        # --- 6. Safely Disconnect ---
         if annealer is not None:
             annealer.disconnect_hardware()
+
+def run_npp_benchmark():
+    print("\n" + "="*50)
+    print("RUNNING NUMBER PARTITIONING BENCHMARK")
+    print("="*50)
+
+    # --- 1. Define Problem ---
+    NUM_SPINS = 40
+    np.random.seed(123)
+    # Integers from 1 to 100
+    weights = np.random.randint(1, 101, size=NUM_SPINS).astype(float)
+    
+    # --- 2. Define Experimental Parameters ---
+    BEAM_SIGMA_X = 600
+    BEAM_SIGMA_Y = 600
+    SERIAL_PORT = 'COM21' # [USER] Verify this port
+    
+    # --- 3. Define Annealing Parameters ---
+    INITIAL_TEMP = 10.0 # NPP "energy" (raw PD) has different scale
+    FINAL_TEMP = 0.001
+    COOLING_RATE = 0.95
+    STEPS_PER_TEMP = 10
+    BATCH_SIZE = 10 # Use batching
+
+    annealer = None
+    try:
+        annealer = NumberPartitioningAnnealer(
+            npp_weights=weights,
+            beam_sigma_x=BEAM_SIGMA_X,
+            beam_sigma_y=BEAM_SIGMA_Y,
+            serial_port=SERIAL_PORT
+        )
+        
+        final_spins, min_energy, energy_data = annealer.run_annealing(
+            initial_temp=INITIAL_TEMP,
+            final_temp=FINAL_TEMP,
+            cooling_rate=COOLING_RATE,
+            steps_per_temp=STEPS_PER_TEMP,
+            batch_size=BATCH_SIZE
+        )
+        
+        print("\n--- NPP Results ---")
+        partition_diff = np.dot(final_spins, weights)
+        print(f"Final Spin Configuration: {final_spins}")
+        print(f"Minimum Energy (raw photodiode): {min_energy:.6f}")
+        print(f"Final Partition Difference (Sum): {partition_diff:.2f}")
+
+
+    except Exception as e:
+        print(f"\nAn error occurred during NPP benchmark: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if annealer is not None:
+            annealer.disconnect_hardware()
+            
+import numpy as np
+import copy
+import diffractsim
+from diffractsim import MonochromaticField, Lens, mm, nm, cm
+
+# 1. Force Backend to CUDA
+diffractsim.set_backend("CUDA")
+
+class SimulatedMaxCutAnnealer(MaxCutAnnealer):
+    def __init__(self, focal_length_cm=50, pixel_pitch_um=8.0, *args, **kwargs):
+        self.focal_length = focal_length_cm * cm
+        self.pixel_pitch = pixel_pitch_um * 1e-6
+        self.sim_field = None
+        self.cached_E_gpu = None  # We will cache the raw GPU array here
+        super().__init__(*args, **kwargs)
+        self.sync_slm = True 
+
+    def _connect_hardware(self):
+        print(" [Simulation] Initializing High-Res Optical Simulation...")
+        
+        # Define 1920x1080 Grid
+        self.slm_width = 1920
+        self.slm_height = 1080
+        extent_x = self.slm_width * self.pixel_pitch
+        extent_y = self.slm_height * self.pixel_pitch
+        
+        # 1. Initialize Field (Allocated on GPU by diffractsim)
+        self.sim_field = MonochromaticField(
+            wavelength=632.8 * nm, extent_x=extent_x, extent_y=extent_y,
+            Nx=self.slm_width, Ny=self.slm_height
+        )
+        
+        # 2. Generate Amplitude Mask on CPU (NumPy) - Safe
+        x_np = np.linspace(-extent_x/2, extent_x/2, self.slm_width)
+        y_np = np.linspace(-extent_y/2, extent_y/2, self.slm_height)
+        X_np, Y_np = np.meshgrid(x_np, y_np)
+        
+        sigma_phys_x = self.beam_sigma_x * self.pixel_pitch
+        sigma_phys_y = self.beam_sigma_y * self.pixel_pitch
+        
+        amplitude_mask_cpu = np.exp(-((X_np**2)/(2*sigma_phys_x**2) + (Y_np**2)/(2*sigma_phys_y**2)))
+        
+        # 3. Explicit Transfer and Setup
+        if hasattr(self.sim_field.E, 'device'):
+            import cupy as cp
+            print(" [Simulation] Backend: CUDA. Moving data to GPU...")
+            
+            # Move mask to GPU
+            amplitude_mask_gpu = cp.asarray(amplitude_mask_cpu)
+            
+            # Apply Mask (Assignment, not in-place, to be safe)
+            self.sim_field.E = self.sim_field.E * amplitude_mask_gpu
+            
+            # CRITICAL: Explicitly cast to COMPLEX128 and cache THIS array
+            # This ensures our "clean state" is definitely complex-ready.
+            self.cached_E_gpu = self.sim_field.E.astype(cp.complex128)
+            
+            # Set the field to this complex version
+            self.sim_field.E = self.cached_E_gpu.copy()
         else:
-            # If annealer init failed, SDK might still be open
-            HEDS.SDK.Exit()
-            print("HEDS SDK closed (in cleanup).")
+            # Fallback for CPU
+            print(" [Simulation] Backend: CPU (Warning: Slow).")
+            self.sim_field.E = self.sim_field.E * amplitude_mask_cpu
+            self.cached_E_gpu = self.sim_field.E.astype(np.complex128)
+            self.sim_field.E = self.cached_E_gpu.copy()
+        
+        # Mock hardware variables
+        self.ser = True 
+        self._last_photodiode_val = 0.0
+        self._center_x = self.slm_width / 2
+        self._center_y = self.slm_height / 2
+
+    def _show_handle_or_buffer(self, buf_idx: int, buf: np.ndarray, wait_for_frame: bool = True):
+        # 1. Restore Field from Cache
+        # We perform a copy so we don't modify the cached clean state
+        self.sim_field.E = self.cached_E_gpu.copy()
+        
+        # 2. Check Device
+        if hasattr(self.sim_field.E, 'device'):
+            import cupy as cp
+            
+            # --- GPU PATH ---
+            gpu_buf = cp.asarray(buf)
+            
+            if self.use_uint8:
+                # Calculate phase values
+                phase_vals = gpu_buf.astype(cp.float64) * (2 * cp.pi / 255.0)
+            else:
+                phase_vals = gpu_buf
+
+            # Calculate Modulation Factor (Complex)
+            modulation = cp.exp(1j * phase_vals)
+
+            # CRITICAL FIX: Use Explicit Assignment (=) instead of In-Place (*=)
+            # This allocates a new memory block for the result, avoiding the type error
+            self.sim_field.E = self.sim_field.E * modulation
+            
+            # Propagate
+            self.sim_field.add(Lens(f=self.focal_length))
+            self.sim_field.propagate(self.focal_length)
+            
+            # Measure (Sum on GPU -> Float on CPU)
+            I = self.sim_field.get_intensity()
+            cy, cx = self.slm_height // 2, self.slm_width // 2
+            pd_reading = float(cp.sum(I[cy-1:cy+2, cx-1:cx+2]))
+
+        else:
+            # --- CPU PATH ---
+            if self.use_uint8:
+                phase_vals = buf.astype(np.float64) * (2 * np.pi / 255.0)
+            else:
+                phase_vals = buf
+            
+            self.sim_field.E = self.sim_field.E * np.exp(1j * phase_vals)
+            self.sim_field.add(Lens(f=self.focal_length))
+            self.sim_field.propagate(self.focal_length)
+            
+            I = self.sim_field.get_intensity()
+            cy, cx = self.slm_height // 2, self.slm_width // 2
+            pd_reading = float(np.sum(I[cy-1:cy+2, cx-1:cx+2]))
+        
+        with self._pd_lock:
+            self._last_photodiode_val = pd_reading
+            
+        return 0, False
+
+    def start_pd_thread(self): pass
+    def stop_pd_thread(self): pass
+    def _safe_load_phase_data(self, buf): return buf 
+    def _release_handle(self, handle): pass
+    def disconnect_hardware(self): print(" [Simulation] Finished.")    
+
+if __name__ == '__main__':
+    
+    # --- Run Benchmarks ---
+    # Note: Each benchmark will connect and disconnect from hardware.
+    
+    def run_maxcut_benchmark():
+        # ...
+        try:
+            annealer = MaxCutAnnealer(..., use_uint8=True)
+            
+            # --- ADD THIS LINE TO THE FILE ---
+            print("Enabling Turbo Mode...")
+            annealer.sync_slm = False 
+            # ---------------------------------
+            
+            annealer.run_annealing(...)
+        except Exception as e:
+            pass
+        finally:
+            if annealer is not None:
+                annealer.disconnect_hardware()
+    
+    print("\nPausing for 5 seconds before next benchmark...")
+    time.sleep(5)
+    
+    run_npp_benchmark()
+
+    print("\nAll benchmarks complete. Exiting.")
+    
+    # This is needed to close plot windows if they are non-blocking
+    plt.show()
