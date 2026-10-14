@@ -51,7 +51,7 @@ if python_api_path not in sys.path:
 try:
     import HEDS
     from hedslib.heds_types import *
-except ImportError:
+except (ImportError, AssertionError):  # HEDS asserts when HEDS_4_1_PYTHON is unset
     print(f"FATAL ERROR: Could not import HEDS library from {python_api_path}")
     print("This script will not be able to connect to the SLM.")
     # We won't exit, to allow for "offline" testing if HEDS is mocked
@@ -691,6 +691,14 @@ class PhotonicAnnealer(ABC):
                 self._filled_buf_queue.put(None, timeout=1.0)
             except Exception:
                 pass
+    def _fill_mask(self, buf: np.ndarray, alpha_ik: np.ndarray, spin_phases: np.ndarray):
+        """Fill 'buf' with the mask for one mode, picking the filler by buffer dtype."""
+        filler = fill_mask_uint8 if buf.dtype == np.uint8 else fill_mask_blocks_numba
+        filler(buf, self._base_checkerboard,
+               alpha_ik, spin_phases,
+               self._spin_y0, self._spin_x0,
+               self._macro_pix_y, self._macro_pix_x)
+
     # ---------------------------------------------------
     # 3. Core Measurement Mechanisms
     # ---------------------------------------------------
@@ -793,12 +801,7 @@ class PhotonicAnnealer(ABC):
 
         # Fill mask
         try:
-            fill_mask_blocks_numba(
-                buf, self._base_checkerboard,
-                alpha_column, spin_phases,
-                self._spin_y0, self._spin_x0,
-                self._macro_pix_y, self._macro_pix_x
-            )
+            self._fill_mask(buf, alpha_column, spin_phases)
         except Exception as e:
             print(f"SingleEval: fill_mask failed: {e}")
             self._free_buf_queue.put_nowait(buf_idx)
@@ -862,12 +865,7 @@ class PhotonicAnnealer(ABC):
             spin_phases = np.where(svec == 1, np.pi/2, 3*np.pi/2).astype(np.float32)
             
             try:
-                fill_mask_blocks_numba(
-                    buf, self._base_checkerboard,
-                    alpha_column, spin_phases,
-                    self._spin_y0, self._spin_x0,
-                    self._macro_pix_y, self._macro_pix_x
-                )
+                self._fill_mask(buf, alpha_column, spin_phases)
             except Exception as e:
                 print(f"BatchEval: fill failed at idx {i}: {e}")
                 self._free_buf_queue.put_nowait(buf_idx) # Return buffer
@@ -1192,7 +1190,7 @@ class MaxCutAnnealer(PhotonicAnnealer):
 
                 if proposed_energy < min_energy:
                     min_energy = proposed_energy
-                    min_spin_vector = np.copy(current_spin_vector)
+                    min_spin_vector = np.copy(proposed_spin_vector)
                 
                 acceptance_prob = math.exp(-delta_energy / temp) if temp > 0 else 0.0
                 is_accepted = (delta_energy < 0) or (random.random() < acceptance_prob)
@@ -1381,7 +1379,7 @@ class NumberPartitioningAnnealer(PhotonicAnnealer):
 
                 for i, E_prop in enumerate(measured_energies):
                     if not np.isfinite(E_prop):
-                        weights.append(0.0)
+                        continue  # failed measurement: not selectable
                     else:
                         delta = float(E_prop) - float(current_energy)
                         # Note: If delta is negative (good move), arg is positive (weight > 1)
@@ -1856,7 +1854,7 @@ def run_npp_benchmark():
             serial_port=SERIAL_PORT
         )
         
-        final_spins, min_energy, energy_data = annealer.run_annealing(
+        final_spins, min_energy = annealer.run_annealing(
             initial_temp=INITIAL_TEMP,
             final_temp=FINAL_TEMP,
             cooling_rate=COOLING_RATE,
