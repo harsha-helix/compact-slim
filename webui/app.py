@@ -27,7 +27,7 @@ if REPO_ROOT not in sys.path:
 import numpy as np
 from flask import Flask, Response, jsonify, request, send_from_directory
 
-from webui import backends, cgh, problems
+from webui import backends, cgh, problems, virtual_hw
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 RUNS_DIR = os.path.join(REPO_ROOT, "webui_runs")
@@ -53,6 +53,7 @@ class Job:
         self.progress = None         # {done, total}
         self.started = time.time()
         self.stop_event = threading.Event()
+        self.virtual_hw = virtual_hw.enabled()
 
     def log(self, msg: str):
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
@@ -290,6 +291,8 @@ def _save_run(job, data):
         os.makedirs(RUNS_DIR, exist_ok=True)
         path = os.path.join(RUNS_DIR, f"{job.kind}_{int(job.started)}_{job.id}.json")
         payload = {"result": job.result, "points": job.points, "logs": job.logs}
+        if job.virtual_hw:
+            payload["virtual_hardware"] = True
         payload["weights" if job.kind == "npp" else "W"] = np.asarray(data).tolist()
         with open(path, "w") as fh:
             json.dump(payload, fh)
@@ -400,6 +403,7 @@ def status():
         hardware=backends.hardware_status(),
         job=None if j is None else {"id": j.id, "kind": j.kind, "status": j.status},
         projecting=S.projector is not None,
+        virtual=virtual_hw.enabled(),
         graph=None if S.graph is None else _graph_summary(S.graph, S.graph_name),
         weights=None if S.weights is None else _npp_summary(S.weights),
     )
@@ -418,6 +422,19 @@ def _graph_summary(W, name):
 
 def _npp_summary(w):
     return {"n": len(w), "sum": float(w.sum()), "weights": w.tolist()}
+
+
+@app.post("/api/virtual")
+def set_virtual():
+    on = bool(request.get_json(force=True).get("on"))
+    with S.lock:
+        if S.busy():
+            return jsonify(error=f"A {S.job.kind} job is running. Stop it first."), 409
+        if on != virtual_hw.enabled():
+            S.release_projector()
+            S.last_phase = None
+            (virtual_hw.enable if on else virtual_hw.disable)()
+    return jsonify(on=virtual_hw.enabled())
 
 
 @app.post("/api/maxcut/generate")
@@ -564,9 +581,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Photonic Ising machine web UI")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8050)
+    ap.add_argument("--mock", action="store_true", help="start with the mock hardware toggle on")
     args = ap.parse_args(argv)
+    if args.mock:
+        virtual_hw.enable()
     print(f"Web UI on http://{args.host}:{args.port}  (HOLOEYE SDK "
-          f"{'found' if backends.pa.HEDS is not None else 'NOT found - hardware modes disabled'})")
+          f"{'found' if virtual_hw.enabled() or backends.pa.HEDS is not None else 'NOT found - hardware modes disabled'})")
     try:
         app.run(host=args.host, port=args.port, threaded=True, use_reloader=False)
     finally:

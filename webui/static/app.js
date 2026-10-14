@@ -54,6 +54,7 @@ async function refreshStatus() {
   try {
     const s = await api("/api/status");
     lastStatus = s;
+    $("#virt-toggle").checked = !!s.virtual;
     const b = [];
     b.push(s.hardware.heds_available ? `<span class="badge ok">HOLOEYE SDK found</span>`
                                      : `<span class="badge warn">HOLOEYE SDK not found — simulation only</span>`);
@@ -67,6 +68,12 @@ async function refreshStatus() {
   } catch (e) { $("#hw-badges").innerHTML = `<span class="badge warn">server unreachable</span>`; }
 }
 setInterval(refreshStatus, 4000);
+$("#virt-toggle").addEventListener("change", async e => {
+  const want = e.target.checked;
+  try { await postJSON("/api/virtual", { on: want }); }
+  catch (err) { e.target.checked = !want; toast(err.message); }
+  refreshStatus();
+});
 
 // ---------------------------------------------------------------- job polling
 class JobWatcher {

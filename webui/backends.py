@@ -14,6 +14,7 @@ import time
 import numpy as np
 
 import photonic_annealing as pa
+from webui import virtual_hw
 
 
 class HardwareError(RuntimeError):
@@ -21,6 +22,8 @@ class HardwareError(RuntimeError):
 
 
 def hardware_status() -> dict:
+    if virtual_hw.enabled():
+        return {"heds_available": True, "serial_ports": virtual_hw.ports()}
     ports = []
     try:
         from serial.tools import list_ports
@@ -43,6 +46,7 @@ def _check_connected(annealer, need_pd: bool = True):
 
 
 def _configure(annealer, opts: dict):
+    virtual_hw.set_beam(annealer.beam_sigma_x, annealer.beam_sigma_y)
     annealer.sync_slm = not opts.get("turbo", False)
     if not opts.get("beam_compensation", True):
         annealer.beamcomp = False
