@@ -151,7 +151,9 @@ class PhotonicAnnealer(ABC):
         serial_port: str = 'COM21',
         serial_baud: int = 115200,
         serial_timeout: float = 0.001,
-        use_uint8: bool = True
+        use_uint8: bool = True,
+        pd_samples_per_measurement: int = 8,
+        pd_timeout: float = 0.05
     ):
         """
         Initializes the annealer and connects to hardware.
@@ -161,6 +163,10 @@ class PhotonicAnnealer(ABC):
             beam_sigma_y (float): Gaussian beam std dev in y.
             serial_port (str): The COM port for the Tiva microcontroller.
             serial_baud (int): The baud rate for the serial connection.
+            pd_samples_per_measurement (int): Fresh PD samples (arriving after
+                the settle point) averaged per measurement. The Tiva firmware
+                sends 2000 samples/s, so 8 samples ~= 4 ms.
+            pd_timeout (float): Max seconds to wait for those fresh samples.
         """
         print("Initializing Photonic Annealer Base...")
         if HEDS is None:
@@ -194,8 +200,14 @@ class PhotonicAnnealer(ABC):
         self._pd_lock = threading.Lock()
         self._last_pd_raw = 0.0
         self._last_pd_avg = 0.0
-        self._pd_buffer = collections.deque(maxlen=80) 
-        self._last_photodiode_val: float = 0.0
+        self._pd_buffer = collections.deque(maxlen=80)
+        # (arrival_time, voltage) for every frame; get_pd_measurement() averages
+        # only samples newer than the settle point.
+        self._pd_samples = collections.deque(maxlen=4096)
+        self.pd_samples_per_measurement = int(pd_samples_per_measurement)
+        self.pd_timeout = float(pd_timeout)
+        self.pd_frame_period: float = 1.0 / 2000  # Tiva firmware OUTPUT_RATE_HZ
+        self.pd_stale_reads: int = 0  # measurements that got no fresh samples
 
         # --- Ising Model Properties (to be set by child) ---
         self.J: np.ndarray = np.empty((0, 0))
@@ -351,6 +363,8 @@ class PhotonicAnnealer(ABC):
                 continue
 
             buf.extend(chunk)
+            t_arrival = time.perf_counter()
+            new_vals = []
             i = 0
 
             while i + FRAME_SIZE <= len(buf):
@@ -369,6 +383,7 @@ class PhotonicAnnealer(ABC):
                 self._pd_buffer.append(voltage)
                 avg_voltage = sum(self._pd_buffer) / len(self._pd_buffer)
 
+                new_vals.append(voltage)
                 with self._pd_lock:
                     self._last_pd_raw = voltage
                     self._last_pd_avg = avg_voltage
@@ -377,6 +392,50 @@ class PhotonicAnnealer(ABC):
 
             if i > 0:
                 del buf[:i]
+
+            # The ICDI USB bridge delivers frames in bursts (~25 frames every
+            # 10-18 ms on Windows), so the arrival time is only right for the
+            # last frame. Back-date earlier frames by the firmware's fixed
+            # frame period so get_pd_measurement() can tell which ones were
+            # sampled after the settle point.
+            if new_vals:
+                n = len(new_vals)
+                with self._pd_lock:
+                    for j, v in enumerate(new_vals):
+                        self._pd_samples.append(
+                            (t_arrival - (n - 1 - j) * self.pd_frame_period, v))
+
+    def get_pd_measurement(self, since: Optional[float] = None,
+                           min_samples: Optional[int] = None,
+                           timeout: Optional[float] = None) -> float:
+        """
+        Returns the mean PD voltage over fresh samples only (those arriving
+        after 'since', default: now), waiting up to 'timeout' for at least
+        'min_samples' of them. Readings from before the current SLM frame
+        settled never enter the average.
+
+        Do NOT call while holding self._pd_lock (it takes the lock itself).
+        """
+        if since is None:
+            since = time.perf_counter()
+        if min_samples is None:
+            min_samples = self.pd_samples_per_measurement
+        if timeout is None:
+            timeout = self.pd_timeout
+
+        deadline = time.perf_counter() + timeout
+        while True:
+            with self._pd_lock:
+                fresh = [v for (t, v) in self._pd_samples if t > since]
+            if len(fresh) >= min_samples or time.perf_counter() >= deadline:
+                break
+            time.sleep(0.0005)
+
+        if not fresh:
+            self.pd_stale_reads += 1
+            with self._pd_lock:
+                return self._last_pd_raw  # fallback: latest (stale) sample
+        return sum(fresh) / len(fresh)
 
     def start_pd_thread(self):
         if self.ser is None:
@@ -682,8 +741,10 @@ class PhotonicAnnealer(ABC):
                 # MEASURE: Measurement (Settle + Read)
                 t_meas_start = time.perf_counter()
                 time.sleep(settle_time)
-                with self._pd_lock:
-                    measured_val = self._last_photodiode_val if self.ser is not None else print("cant read pd")
+                if self.ser is not None:
+                    measured_val = self.get_pd_measurement()
+                else:
+                    measured_val = 0.5 + 0.1 * np.random.randn()  # Mock (offline)
                 self.stats['measurement'] += (time.perf_counter() - t_meas_start)
 
                 num_measured += 1
@@ -760,8 +821,10 @@ class PhotonicAnnealer(ABC):
                 print(f"SingleEval: show failed: {HEDS.SDK.ErrorString(err)}")
             else:
                 time.sleep(settle_time)
-                with self._pd_lock:
-                    measured_val = self._last_photodiode_val if self.ser is not None else (0.5 + 0.1 * np.random.randn()) # Mock data
+                if self.ser is not None:
+                    measured_val = self.get_pd_measurement()
+                else:
+                    measured_val = 0.5 + 0.1 * np.random.randn()  # Mock (offline)
         except Exception as e:
             print(f"SingleEval: exception during show/measure: {e}")
         
@@ -830,8 +893,10 @@ class PhotonicAnnealer(ABC):
                     print(f"BatchEval: show failed for input idx {i}")
                 else:
                     time.sleep(settle_time)
-                    with self._pd_lock:
-                        measured_values[i] = self._last_photodiode_val if self.ser is not None else (0.5 + 0.1 * np.random.randn()) # Mock
+                    if self.ser is not None:
+                        measured_values[i] = self.get_pd_measurement()
+                    else:
+                        measured_values[i] = 0.5 + 0.1 * np.random.randn()  # Mock (offline)
             except Exception as e:
                 print(f"BatchEval: show/measure exception for idx {i}: {e}")
             
@@ -1524,25 +1589,17 @@ class RobustDynamicNPPAnnealer(NumberPartitioningAnnealer):
         # 5. Measure (Photodiode)
         # time.sleep(settle_time)
         
-        val = 0.0
-        with self._pd_lock:
-            if self.ser is None or not self.ser.is_open:
-                val = (np.dot(spin_vector, self.npp_weights)**2) * 0.0001
-                print("Warning: Serial port not open, returning theoretical value with noise.")
-            else:
-                print("entering photodiode measurement loop")
-                for i in range(100):
-                    energy = self._last_photodiode_val
-                    val += energy
-                    print(val)
-                    i+=1
-                    time.sleep(0.01)  # Small delay to avoid overwhelming the serial port
+        if self.ser is None or not self.ser.is_open:
+            val = (np.dot(spin_vector, self.npp_weights)**2) * 0.0001
+            print("Warning: Serial port not open, returning theoretical value with noise.")
+        else:
+            val = self.get_pd_measurement()
 
         # --- TIMER SPLIT: Measurement Done ---
         t3 = time.perf_counter()
         self.timings['photodiode'].append(t3 - t2)
-                
-        return val/80
+
+        return val
 
     def run_annealing(self, 
                       initial_temp: float, 
@@ -1638,7 +1695,7 @@ class ThreadedDynamicNPPAnnealer(RobustDynamicNPPAnnealer):
     """
     NPP Annealer that uses the SAME measurement technique as MaxCutAnnealer.
     
-    1. Background Thread: RUNNING (continuously updates self._last_photodiode_val)
+    1. Background Thread: RUNNING (continuously appends timestamped PD samples)
     2. Measurement: Waits for settle_time, then grabs the variable.
     3. Queues: Bypassed (Direct Buffer) for speed, but PD logic is threaded.
     """
@@ -1657,7 +1714,7 @@ class ThreadedDynamicNPPAnnealer(RobustDynamicNPPAnnealer):
         Max-Cut Style Measurement:
         1. Show Mask.
         2. Sleep (Settle).
-        3. Read self._last_photodiode_val (updated by background thread).
+        3. Average fresh PD samples via get_pd_measurement().
         """
         # --- 1. MASK GENERATION ---
         # (Same optimized Numba/Direct Buffer code as before)
@@ -1704,22 +1761,13 @@ class ThreadedDynamicNPPAnnealer(RobustDynamicNPPAnnealer):
         # It needs to be: SLM_Response_Time + Serial_Latency
         time.sleep(settle_time)
         
-        val = 0.0
-        
-        # B. Simply read the variable that the thread is updating
-        with self._pd_lock:
-            if self.ser is None or not self.ser.is_open:
-                 # Simulation fallback
-                 val = (np.dot(spin_vector, self.npp_weights)**2) * 0.0001
-                 print("Warning: Serial port not open, returning theoretical value with noise.")
-            else:
-                 print("Reading photodiode value from background thread...")
-                 for i in range(150):
-                     energy = self._last_photodiode_val
-                     val += energy
-                    #  print(val)
-                     i+=1
-                 print("Finished reading photodiode values.", val)
+        # B. Average fresh samples from the background reader thread
+        if self.ser is None or not self.ser.is_open:
+            # Simulation fallback
+            val = (np.dot(spin_vector, self.npp_weights)**2) * 0.0001
+            print("Warning: Serial port not open, returning theoretical value with noise.")
+        else:
+            val = self.get_pd_measurement()
 
         return val
 # -----------------------------------------------------------------
