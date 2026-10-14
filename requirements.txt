@@ -1,0 +1,9 @@
+numpy
+scipy
+matplotlib
+numba
+pyserial
+pillow
+flask
+# Optional, only for simulating_spim.py:
+# diffractsim

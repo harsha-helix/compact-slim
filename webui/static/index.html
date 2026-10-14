@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compact SLM Ising Machine</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>Compact SLM Ising Machine</h1>
+  <div id="hw-badges"></div>
+  <nav>
+    <button class="tab active" data-tab="maxcut">Max-Cut</button>
+    <button class="tab" data-tab="npp">Number Partitioning</button>
+    <button class="tab" data-tab="holo">Holography</button>
+  </nav>
+</header>
+
+<main>
+<!-- ======================= MAX-CUT ======================= -->
+<section id="tab-maxcut" class="tabpane active">
+  <div class="cols">
+    <div class="side">
+      <fieldset>
+        <legend>1 · Graph</legend>
+        <label>Type
+          <select id="mc-kind">
+            <option value="erdos_renyi">Erdős–Rényi G(n, p)</option>
+            <option value="regular">Random d-regular</option>
+            <option value="complete">Complete (weighted)</option>
+            <option value="torus">2D toroidal grid</option>
+          </select></label>
+        <div class="row">
+          <label>Nodes n <input id="mc-n" type="number" value="20" min="2" max="2000"></label>
+          <label class="kind-er">Edge prob. p <input id="mc-p" type="number" value="0.5" step="0.05" min="0" max="1"></label>
+          <label class="kind-reg hidden">Degree d <input id="mc-degree" type="number" value="3" min="1"></label>
+        </div>
+        <div class="row">
+          <label>Weights
+            <select id="mc-weights">
+              <option value="unit">All 1</option>
+              <option value="pm1">Random ±1</option>
+              <option value="int">Random int 1..k</option>
+              <option value="gauss">Gaussian</option>
+            </select></label>
+          <label class="w-int hidden">k <input id="mc-wmax" type="number" value="10" min="1"></label>
+          <label>Seed <input id="mc-seed" type="number" placeholder="random"></label>
+        </div>
+        <div class="row">
+          <button id="mc-generate" class="primary">Generate graph</button>
+          <label class="filebtn">Load G-set file…<input id="mc-file" type="file" accept=".txt,.dat,.gset,.edges"></label>
+        </div>
+        <p id="mc-summary" class="muted">No graph yet.</p>
+      </fieldset>
+
+      <fieldset class="run-opts" data-problem="maxcut">
+        <legend>2 · Run</legend>
+        <div class="seg" data-name="mode">
+          <button data-value="hardware">SLM hardware</button>
+          <button data-value="simulation" class="on">Simulation</button>
+        </div>
+        <div class="hw-only">
+          <div class="row">
+            <label>PD serial port <input name="serial_port" list="ports" value="COM21"></label>
+          </div>
+          <div class="row">
+            <label>Beam σx (px) <input name="beam_sigma_x" type="number" value="600"></label>
+            <label>Beam σy (px) <input name="beam_sigma_y" type="number" value="600"></label>
+          </div>
+          <label class="check"><input name="beam_compensation" type="checkbox" checked> Gaussian beam compensation</label>
+          <label class="check"><input name="turbo" type="checkbox"> Turbo (fixed 8 ms settle instead of V-sync)</label>
+        </div>
+        <div class="sim-only">
+          <label>Measurement noise (× energy scale) <input name="noise" type="number" value="0" step="0.01" min="0"></label>
+          <label>Slow-down per evaluation (ms, to watch the curve) <input name="sim_delay_ms" type="number" value="5" min="0"></label>
+        </div>
+        <details>
+          <summary>Annealing schedule</summary>
+          <div class="row">
+            <label>T initial <input name="t_initial" type="number" value="1" step="any"></label>
+            <label>T final <input name="t_final" type="number" value="0.01" step="any"></label>
+          </div>
+          <div class="row">
+            <label>Cooling rate <input name="cooling_rate" type="number" value="0.9" step="0.01"></label>
+            <label>Steps / T <input name="steps_per_temp" type="number" placeholder="n"></label>
+          </div>
+          <label>Temperature units
+            <select name="temp_mode">
+              <option value="relative">× spread of random-state energies (calibrated)</option>
+              <option value="absolute">absolute (measured-energy units)</option>
+            </select></label>
+          <div class="row">
+            <label>Move
+              <select name="move"><option value="single">Single spin flip</option><option value="cluster">Fixed cluster flip</option></select></label>
+            <label>Cluster size <input name="cluster_size" type="number" placeholder="15% of n"></label>
+          </div>
+          <div class="row">
+            <label>CPU SA sweeps <input name="cpu_sweeps" type="number" value="3000"></label>
+            <label>Exact if n ≤ <input name="exact_max_n" type="number" value="24" max="30"></label>
+          </div>
+        </details>
+        <div class="row">
+          <button class="run primary">Start annealing</button>
+          <button class="stop danger" disabled>Stop</button>
+        </div>
+        <p class="eta muted"></p>
+      </fieldset>
+    </div>
+
+    <div class="main">
+      <div class="card">
+        <div class="card-head"><h2>Measured energy</h2><span class="progress muted"></span></div>
+        <canvas class="plot" id="mc-plot-energy"></canvas>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Cut value of current state <span class="muted">(computed on CPU)</span></h2></div>
+        <canvas class="plot" id="mc-plot-metric"></canvas>
+      </div>
+      <div class="grid2">
+        <div class="card"><h2>Comparison</h2><div id="mc-results" class="muted">Run the annealer to compare.</div></div>
+        <div class="card"><h2>Graph &amp; best cut</h2><canvas id="mc-graph" class="graph"></canvas></div>
+      </div>
+      <details class="card logs"><summary>Log</summary><pre id="mc-log"></pre></details>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= NPP ======================= -->
+<section id="tab-npp" class="tabpane">
+  <div class="cols">
+    <div class="side">
+      <fieldset>
+        <legend>1 · Numbers</legend>
+        <div class="row">
+          <label>Count n <input id="npp-n" type="number" value="40" min="2"></label>
+          <label>Max value <input id="npp-wmax" type="number" value="100" min="1"></label>
+          <label>Seed <input id="npp-seed" type="number" placeholder="random"></label>
+        </div>
+        <label>…or your own numbers <textarea id="npp-custom" rows="2" placeholder="e.g. 8 7 6 5 4"></textarea></label>
+        <button id="npp-generate" class="primary">Generate set</button>
+        <p id="npp-summary" class="muted">No numbers yet.</p>
+      </fieldset>
+
+      <fieldset class="run-opts" data-problem="npp">
+        <legend>2 · Run</legend>
+        <div class="seg" data-name="mode">
+          <button data-value="hardware">SLM hardware</button>
+          <button data-value="simulation" class="on">Simulation</button>
+        </div>
+        <div class="hw-only">
+          <div class="row">
+            <label>PD serial port <input name="serial_port" list="ports" value="COM21"></label>
+          </div>
+          <div class="row">
+            <label>Beam σx (px) <input name="beam_sigma_x" type="number" value="357"></label>
+            <label>Beam σy (px) <input name="beam_sigma_y" type="number" value="357"></label>
+          </div>
+          <label class="check"><input name="beam_compensation" type="checkbox" checked> Gaussian beam compensation</label>
+          <label class="check"><input name="turbo" type="checkbox"> Turbo (skip V-sync wait)</label>
+        </div>
+        <div class="sim-only">
+          <label>Measurement noise (absolute, PD units) <input name="noise" type="number" value="0" step="0.0001" min="0"></label>
+          <label>Slow-down per evaluation (ms, to watch the curve) <input name="sim_delay_ms" type="number" value="5" min="0"></label>
+        </div>
+        <details>
+          <summary>Annealing schedule</summary>
+          <div class="row">
+            <label>T initial <input name="t_initial" type="number" value="1" step="any"></label>
+            <label>T final <input name="t_final" type="number" value="0.0001" step="any"></label>
+          </div>
+          <div class="row">
+            <label>Cooling rate <input name="cooling_rate" type="number" value="0.9" step="0.01"></label>
+            <label>Steps / T <input name="steps_per_temp" type="number" value="30"></label>
+          </div>
+          <label>Temperature units
+            <select name="temp_mode">
+              <option value="relative">× spread of random-state energies (calibrated)</option>
+              <option value="absolute">absolute (PD units)</option>
+            </select></label>
+          <div class="row">
+            <label>Move
+              <select name="move"><option value="cluster">Adaptive cluster flip</option><option value="single">Single spin flip</option></select></label>
+            <label>Cluster Nc0 <input name="cluster_size" type="number" placeholder="15% of n"></label>
+          </div>
+          <label>CPU SA sweeps <input name="cpu_sweeps" type="number" value="3000"></label>
+        </details>
+        <div class="row">
+          <button class="run primary">Start annealing</button>
+          <button class="stop danger" disabled>Stop</button>
+        </div>
+        <p class="eta muted"></p>
+      </fieldset>
+    </div>
+
+    <div class="main">
+      <div class="card">
+        <div class="card-head"><h2>Measured energy (photodiode)</h2><span class="progress muted"></span></div>
+        <canvas class="plot" id="npp-plot-energy"></canvas>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>|Partition difference| of current state <span class="muted">(computed on CPU)</span></h2>
+          <label class="check small"><input id="npp-log" type="checkbox" checked> log scale</label></div>
+        <canvas class="plot" id="npp-plot-metric"></canvas>
+      </div>
+      <div class="grid2">
+        <div class="card"><h2>Comparison</h2><div id="npp-results" class="muted">Run the annealer to compare.</div></div>
+        <div class="card"><h2>Best partition</h2><div id="npp-partition" class="muted">—</div></div>
+      </div>
+      <details class="card logs"><summary>Log</summary><pre id="npp-log-text"></pre></details>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= HOLOGRAPHY ======================= -->
+<section id="tab-holo" class="tabpane">
+  <div class="cols">
+    <div class="side">
+      <fieldset>
+        <legend>1 · Target image</legend>
+        <label class="drop" id="holo-drop">
+          <input id="holo-file" type="file" accept="image/*">
+          <span>Drop an image here or click to choose</span>
+          <img id="holo-thumb" alt="" class="hidden">
+        </label>
+        <div class="row">
+          <label class="check"><input id="holo-invert" type="checkbox"> Invert</label>
+          <label>Gamma <input id="holo-gamma" type="number" value="1" step="0.1" min="0.1"></label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>2 · Hologram</legend>
+        <label>Method
+          <select id="holo-method">
+            <option value="gs">Gerchberg–Saxton (this app)</option>
+            <option value="sdk">HOLOEYE SDK built-in CGH</option>
+          </select></label>
+        <div class="row">
+          <label>Image size (fraction of SLM) <input id="holo-size" type="number" value="0.35" step="0.05" min="0.05" max="1"></label>
+          <label class="gs-only">Iterations <input id="holo-iters" type="number" value="30" min="1"></label>
+        </div>
+        <div class="gs-only">
+          <label class="check"><input id="holo-gauss" type="checkbox"> Gaussian illumination</label>
+          <div class="row holo-gauss-opts hidden">
+            <label>σx (px) <input id="holo-sx" type="number" value="600"></label>
+            <label>σy (px) <input id="holo-sy" type="number" value="600"></label>
+          </div>
+          <div class="row">
+            <label title="Blazed grating period in pixels; moves the image away from the zero order. 0 = off.">Grating x period (px) <input id="holo-gx" type="number" value="6"></label>
+            <label>Grating y period (px) <input id="holo-gy" type="number" value="0"></label>
+          </div>
+          <div class="row">
+            <label title="Adds a Fresnel lens; 0 = Fourier plane (no lens)">Lens focal length (mm) <input id="holo-f" type="number" value="0"></label>
+            <label>Wavelength (nm) <input id="holo-wl" type="number" value="633"></label>
+            <label>Pixel pitch (µm) <input id="holo-px" type="number" placeholder="from SLM" step="0.01"></label>
+          </div>
+          <div class="row no-slm">
+            <label>Width (px) <input id="holo-w" type="number" value="1920"></label>
+            <label>Height (px) <input id="holo-h" type="number" value="1080"></label>
+          </div>
+        </div>
+        <label class="check"><input id="holo-project" type="checkbox" checked> Project on SLM</label>
+        <div class="row">
+          <button id="holo-run" class="primary">Compute hologram</button>
+          <button id="holo-stop" class="danger" disabled>Stop</button>
+          <button id="holo-blank">Blank SLM</button>
+        </div>
+        <p id="holo-status" class="muted"></p>
+      </fieldset>
+    </div>
+    <div class="main">
+      <div class="card">
+        <div class="card-head"><h2>Gerchberg–Saxton convergence</h2><span id="holo-progress" class="muted"></span></div>
+        <canvas class="plot" id="holo-plot"></canvas>
+      </div>
+      <div class="grid2">
+        <div class="card"><h2>Simulated reconstruction <span class="muted">(sanity check, before grating/lens)</span></h2><img id="holo-recon" class="preview" alt=""></div>
+        <div class="card"><h2>Phase mask</h2><img id="holo-phase" class="preview" alt="">
+          <p><a id="holo-download" class="hidden" href="/api/holo/mask.png">Download 8-bit phase mask (full resolution)</a></p></div>
+      </div>
+      <details class="card logs"><summary>Log</summary><pre id="holo-log"></pre></details>
+    </div>
+  </div>
+</section>
+</main>
+
+<datalist id="ports"></datalist>
+<div id="toast" class="hidden"></div>
+<script src="/static/plot.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
