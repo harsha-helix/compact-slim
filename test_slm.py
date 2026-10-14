@@ -14,7 +14,7 @@ except ImportError:
     print(f"FATAL ERROR: Could not import HEDS library from {python_api_path}")
     print("Please verify the 'sdk_install_path' variable in this script.")
     sys.exit(1)
-from photonic_annealing import PhotonicAnnealer, NumberPartitioningAnnealer, MaxCutAnnealer, SimulatedMaxCutAnnealer, RobustDynamicNPPAnnealer
+from photonic_annealing import PhotonicAnnealer, NumberPartitioningAnnealer, MaxCutAnnealer, RobustDynamicNPPAnnealer
 from photonic_annealing import *
 # from photonic_annealing.npp_annealer import NumberPartitioningAnnealer
 
